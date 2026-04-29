@@ -428,28 +428,40 @@ end
 % MEMORY OPTIMIZED: Get dimensions from unfiltered data
 [num_samples, num_channels] = size(unfiltered_data);
 
+n_PCs_opt = [];
 % --- Optional: Optimization of artifact_threshold_type ---
 if ischar(artifact_threshold_type) && strcmpi(artifact_threshold_type, 'bayesopt')
     disp([newline 'Bayesian Optimization of SENSAI score...']);
     
     try
         % 1. Attempt Bayesian Optimization
-        vars = optimizableVariable('strength', [0, 10]);
-        InitialPoints = table(7, 'VariableNames', {'strength'});
+        vars = [
+            optimizableVariable('strength', [0, 10]),
+            optimizableVariable('n_PCs', [2, 6], 'Type', 'integer')
+        ];
+        InitialPoints = table([7; 7; 7], [3; 4; 5], 'VariableNames', {'strength', 'n_PCs'});
         results = bayesopt(@gedai_outer_objective, vars, ...
             'InitialX', InitialPoints, ...
-            'MaxObjectiveEvaluations', 10, ... % Sufficient for 1D search
+            'MaxObjectiveEvaluations', 30, ... % Increased for 2D search
             'NumSeedPoints', 3, ... 
             'PlotFcn', {@plotObjectiveModel}, ... 
             'Verbose', 0);
         artifact_threshold_type = results.XAtMinObjective.strength;
+        n_PCs_opt = results.XAtMinObjective.n_PCs;
         
     catch
         % 2. Fallback to Brent's method (local_fminbnd)
         disp([newline 'Fallback to Golden Section Optimization of SENSAI score...']);
-        [artifact_threshold_type, ~] = local_fminbnd(@(v) gedai_outer_objective(v), 0, 10, 0.2);
+        if strcmpi(signal_type, 'meg')
+            default_n_PCs = 4;
+        else
+            default_n_PCs = 3;
+        end
+        [artifact_threshold_type, ~] = local_fminbnd(@(v) gedai_outer_objective([v, default_n_PCs]), 0, 10, 0.2);
+        n_PCs_opt = default_n_PCs;
     end
-    disp(['Optimal artifact_threshold_strength: ' num2str(artifact_threshold_type) newline]);
+    disp(['Optimal artifact_threshold_strength: ' num2str(artifact_threshold_type)]);
+    disp(['Optimal n_PCs: ' num2str(n_PCs_opt) newline]);
     close
     
 end
@@ -481,11 +493,11 @@ if parallel
             end
 
             try
-                 [cleaned_band_data, ~, temp_sensai, temp_thresh, temp_enova_val] = GEDAI_per_band(wavelet_data_band, srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold);
+                 [cleaned_band_data, ~, temp_sensai, temp_thresh, temp_enova_val] = GEDAI_per_band(wavelet_data_band, srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, 12, n_PCs_opt);
             catch ME
                  % If OOM or other memory error, try single precision
                  warning('GEDAI_per_band failed for band %d: %s. Retrying with single precision...', f, ME.message);
-                 [cleaned_band_data, ~, temp_sensai, temp_thresh, temp_enova_val] = GEDAI_per_band(single(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold);
+                 [cleaned_band_data, ~, temp_sensai, temp_thresh, temp_enova_val] = GEDAI_per_band(single(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, 12, n_PCs_opt);
             end
             
             % RAM OPTIMIZATION: Accumulate directly using a reduction variable (avoids massive cell array copies)
@@ -527,11 +539,11 @@ if ~parallel || ~success_parallel
             
             try
              disp(['processing wavelet band = ' num2str(f)])   
-             [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(double(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold);
+             [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(double(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, 12, n_PCs_opt);
             
             catch ME
                 warning('GEDAI_per_band failed for band %d: %s. Retrying with single precision...', f, ME.message);
-                [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(single(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold);
+                [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(single(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, 12, n_PCs_opt);
             end
             
             % MEMORY OPTIMIZED: Accumulate directly into 2D array
@@ -562,7 +574,7 @@ if ~parallel || ~success_parallel
                 current_minThreshold = -6;
             end
             
-            [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(single(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold);
+            [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(single(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, 12, n_PCs_opt);
             disp(['processing wavelet band (single) = ' num2str(f)])
             
             % MEMORY OPTIMIZED: Accumulate directly into 2D array
@@ -851,7 +863,13 @@ if exist('eegh', 'file')
 end
 
     function neg_score = gedai_outer_objective(tbl)
-        if istable(tbl), str_val = tbl.strength; else, str_val = tbl; end
+        if istable(tbl)
+            str_val = tbl.strength;
+            n_pcs_val = tbl.n_PCs;
+        else
+            str_val = tbl(1);
+            n_pcs_val = tbl(2);
+        end
         
         % Denoise wavelet bands with current strength
         cl_wv_obj = zeros(num_channels, num_samples, 'like', unfiltered_data);
@@ -861,7 +879,7 @@ end
                 ep_sz_obj = epoch_sizes_per_wavelet_band(f_obj);
                 cf_obj = center_frequencies(f_obj);
                 mt_obj = 0; if (cf_obj >= 7 && cf_obj <= 13), mt_obj = -6; end
-                [cl_b_obj, ~, ~, ~, ~] = GEDAI_per_band(double(wv_band_obj), srate, EEGavRef.chanlocs, str_val, ep_sz_obj, refCOV, 'parabolic', false, signal_type, mt_obj);
+                [cl_b_obj, ~, ~, ~, ~] = GEDAI_per_band(double(wv_band_obj), srate, EEGavRef.chanlocs, str_val, ep_sz_obj, refCOV, 'parabolic', false, signal_type, mt_obj, 12, n_pcs_val);
                 cl_wv_obj = cl_wv_obj + cl_b_obj;
             end
         else
@@ -870,7 +888,7 @@ end
                 ep_sz_obj = epoch_sizes_per_wavelet_band(f_obj);
                 cf_obj = center_frequencies(f_obj);
                 mt_obj = 0; if (cf_obj >= 7 && cf_obj <= 13), mt_obj = -6; end
-                [cl_b_obj, ~, ~, ~, ~] = GEDAI_per_band(double(wv_band_obj), srate, EEGavRef.chanlocs, str_val, ep_sz_obj, refCOV, 'parabolic', false, signal_type, mt_obj);
+                [cl_b_obj, ~, ~, ~, ~] = GEDAI_per_band(double(wv_band_obj), srate, EEGavRef.chanlocs, str_val, ep_sz_obj, refCOV, 'parabolic', false, signal_type, mt_obj, 12, n_pcs_val);
                 cl_wv_obj = cl_wv_obj + cl_b_obj;
             end
         end
