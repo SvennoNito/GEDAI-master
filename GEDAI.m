@@ -900,7 +900,7 @@ end
         % Reconstruct and score
         EEGclean_obj_data = cl_wv_obj;
         EEGartifacts_obj_data = EEGavRef.data(:, 1:size(EEGclean_obj_data, 2)) - EEGclean_obj_data;
-        [~, ~, ~, ~, ~, ~, ~, raw_quality_obj, ~] = SENSAI_basic(double(EEGclean_obj_data), double(EEGartifacts_obj_data), srate, broadband_epoch_size, refCOV, 1, signal_type);
-        neg_score = -raw_quality_obj;
+        [~, ~, ~, ~, ~, ~, sensai_norm_obj, ~, ~] = SENSAI_basic(double(EEGclean_obj_data), double(EEGartifacts_obj_data), srate, broadband_epoch_size, refCOV, 1, signal_type);
+        neg_score = -sensai_norm_obj;
     end
 end
