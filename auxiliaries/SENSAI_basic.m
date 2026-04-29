@@ -11,7 +11,7 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [SENSAI_score, SIGNAL_subspace_similarity, NOISE_subspace_similarity, mean_ENOVA, ENOVA_per_epoch, signal_silhouette, SENSAI_normalized] = SENSAI_basic(signal_data, noise_data, srate, epoch_size, refCOV, NOISE_multiplier, signal_type)
+function [SENSAI_score, SIGNAL_subspace_similarity, NOISE_subspace_similarity, mean_ENOVA, ENOVA_per_epoch, signal_silhouette, SENSAI_normalized, Raw_Quality_Score, BW_Raw_Quality] = SENSAI_basic(signal_data, noise_data, srate, epoch_size, refCOV, NOISE_multiplier, signal_type)
 
     %   Calculates the Signal & Noise Subspace Alignment Index (SENSAI) from raw EEG data
     
@@ -51,6 +51,8 @@ num_epochs = size(signal_EEG_epoched, 3);
 SIGNAL_subspace_similarity_distribution = zeros(1, num_epochs);
 NOISE_subspace_similarity_distribution = zeros(1, num_epochs);
 ENOVA_per_epoch = zeros(1, num_epochs);
+Raw_Quality_Distribution = zeros(1, num_epochs);
+Normalized_BW_Distribution = zeros(1, num_epochs);
 
 for epoch = 1:num_epochs
     % SIGNAL SUBSPACE: top eigenvectors of signal covariance
@@ -75,9 +77,34 @@ for epoch = 1:num_epochs
     var_original = var(original_epoch(:));
     var_noise = var(reshape(noise_EEG_epoched(:,:,epoch), [], 1));
     ENOVA_per_epoch(epoch) = var_noise / var_original;
+
+    % Bures-Wasserstein (BW) Fidelity Calculation with 90% Variance Truncation
+    calc_bw = @(C, Ref) real(trace(real(sqrtm( real(sqrtm(C/trace(C))) * (Ref/trace(Ref)) * real(sqrtm(C/trace(C))) ))))^2;
+    
+    % Truncate to 90% variance to remove noise floor
+    cov_raw = cov(original_epoch');
+    cov_raw_trunc = truncate_cov(cov_raw, 0.9);
+    cov_signal_trunc = truncate_cov(cov_signal_EEG, 0.9);
+    cov_noise_trunc = truncate_cov(cov_noise, 0.9);
+    
+    bw_raw   = calc_bw(cov_raw_trunc, refCOV_reg);
+    bw_clean = calc_bw(cov_signal_trunc, refCOV_reg);
+    bw_noise = calc_bw(cov_noise_trunc, refCOV_reg);
+    
+    % Optimization metric: Absolute BW Contrast (Brain minus Noise)
+    Raw_Quality_Distribution(epoch) = bw_clean - bw_noise;
+    
+    % Raw Quality Metric (Normalized Ratio)
+    if (bw_clean - bw_noise) < 1e-6
+        Normalized_BW_Distribution(epoch) = 0;
+    else
+        Normalized_BW_Distribution(epoch) = (bw_raw - bw_noise) / (bw_clean - bw_noise);
+    end
 end
 
 mean_ENOVA = mean(ENOVA_per_epoch);
+Raw_Quality_Score = mean(Raw_Quality_Distribution);
+BW_Raw_Quality = mean(Normalized_BW_Distribution);
 SIGNAL_subspace_similarity = 100 * mean(SIGNAL_subspace_similarity_distribution);
 NOISE_subspace_similarity = 100 * mean(NOISE_subspace_similarity_distribution);
 
@@ -116,4 +143,29 @@ catch
 end
 
 SENSAI_score = SIGNAL_subspace_similarity - NOISE_multiplier * NOISE_subspace_similarity;
+end
+
+function C_out = truncate_cov(C, threshold)
+    % Ensure matrix is symmetric
+    C = (C + C') / 2;
+    [V, D] = eig(full(C));
+    [evals, idx] = sort(real(diag(D)), 'descend');
+    
+    % Calculate cumulative variance percentage
+    total_var = sum(evals);
+    if total_var < eps
+        C_out = zeros(size(C));
+        return;
+    end
+    
+    cum_var = cumsum(evals) / total_var;
+    % Find index where we hit the threshold
+    k = find(cum_var >= threshold, 1);
+    if isempty(k), k = length(evals); end
+    
+    % Reconstruct the matrix using only the top k components
+    V_k = V(:, idx(1:k));
+    D_k = diag(evals(1:k));
+    C_out = V_k * D_k * V_k';
+    C_out = real(C_out);
 end
