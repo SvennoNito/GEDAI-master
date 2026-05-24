@@ -8,10 +8,10 @@
 %    >>  [EEG] = GEDAI(EEG);
 %
 % Example 2: Defining some parameters
-%    >>  [EEG] = GEDAI(EEG, 'auto', 12, 0.5, 'precomputed', true, false, 0.9);
+%    >>  [EEG] = GEDAI(EEG, 'auto', 12, 0.8, 'precomputed', true, false, 0.9);
 %
 % Example 3: Using a "custom" [channel x channel] reference matrix 
-%    >>  [EEG] = GEDAI(EEG, 'auto', 12, 0.5, your_refCOV);
+%    >>  [EEG] = GEDAI(EEG, 'auto', 12, 0.8, your_refCOV);
 %
 % Inputs: 
 % 
