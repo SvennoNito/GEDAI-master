@@ -55,6 +55,14 @@ global_log_prctile = prctile(log_Eig_val_all, percentile_threshold);
 Treshold1_array = T1_array * global_log_prctile;
 
 
+%% Compute Regularized Reference Covariance for fast linear system bypass
+refCOV = real(refCOV);
+refCOV = (refCOV + refCOV') / 2;
+regularization_lambda = 0.05;
+reg_val = trace(refCOV) / num_chans;
+refCOV_reg = (1-regularization_lambda)*refCOV + regularization_lambda*reg_val*eye(num_chans, 'like', refCOV);
+refCOV_reg = (refCOV_reg + refCOV_reg') / 2;
+
 %% Cleaning EEG by removing outlying GEVD components
 epoch_samples = round(srate * epoch_size);
 artifacts = zeros(size(EEGdata_epoched), 'like', EEGdata_epoched);
@@ -77,7 +85,7 @@ for i = 1:num_epochs
     % --- OPTIMIZATION END ---
 
     artifacts_timecourses = component_spatial_filter' * EEGdata_epoched(:,:,i);    
-    Signal_to_remove = Evec(:,:,i)' \ artifacts_timecourses;
+    Signal_to_remove = refCOV_reg * (Evec(:,:,i) * artifacts_timecourses);
     
     artifacts(:, :, i) = Signal_to_remove;
     cleaned_epoch = EEGdata_epoched(:,:,i) - Signal_to_remove;

@@ -67,31 +67,93 @@ shifting = epoch_samples / 2;
 eeg_data_2 = eeg_data(:, (shifting+1):(end-shifting));
 EEGdata_epoched_2 = reshape(eeg_data_2, N_EEG_electrodes, epoch_samples, []);
 [~,~,N_epochs] = size(EEGdata_epoched);
-%% Calculate Covariance Matrix per Epoch
-COV = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
-COV_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
-for epo=1:N_epochs-1
-    COV(:,:,epo) = cov(EEGdata_epoched(:,:,epo)');
-    COV_2(:,:,epo) = cov(EEGdata_epoched_2(:,:,epo)');
-end
-COV(:,:,N_epochs) = cov(EEGdata_epoched(:,:,N_epochs)');
-%% Generalized Eigendecomposition (GEVD)
+%% Calculate Covariance Matrix per Epoch (Vectorized)
+mean_ep = mean(EEGdata_epoched, 2);
+X_zero_mean = EEGdata_epoched - mean_ep;
+COV = pagemtimes(X_zero_mean, 'none', X_zero_mean, 'transpose') / (epoch_samples - 1);
+COV = (COV + permute(COV, [2, 1, 3])) / 2;
+
+mean_ep_2 = mean(EEGdata_epoched_2, 2);
+X_zero_mean_2 = EEGdata_epoched_2 - mean_ep_2;
+COV_2 = pagemtimes(X_zero_mean_2, 'none', X_zero_mean_2, 'transpose') / (epoch_samples - 1);
+COV_2 = (COV_2 + permute(COV_2, [2, 1, 3])) / 2;
+
+%% Generalized Eigendecomposition (GEVD) (Vectorized via Cholesky + pageeig)
 regularization_lambda = 0.05;
 reg_val = trace(refCOV) / N_EEG_electrodes;
 refCOV_reg = (1-regularization_lambda)*refCOV + regularization_lambda*reg_val*eye(N_EEG_electrodes, 'like', refCOV);
 refCOV_reg = (refCOV_reg + refCOV_reg') / 2;
-Evec = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
-Eval = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
-Evec_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
-Eval_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
-for i=1:N_epochs-1
-    COV(:,:,i) = (COV(:,:,i) + COV(:,:,i)') / 2;
-    [Evec(:,:,i), Eval(:,:,i)] = eig(COV(:,:,i), refCOV_reg, 'chol');
-    COV_2(:,:,i) = (COV_2(:,:,i) + COV_2(:,:,i)') / 2;
-    [Evec_2(:,:,i), Eval_2(:,:,i)] = eig(COV_2(:,:,i), refCOV_reg, 'chol');
+
+% Use standard generalized eig loop as a fallback if pageeig is not available
+success_pageeig = false;
+if exist('pageeig', 'builtin') || exist('pageeig', 'file')
+    try
+        % 1. Precompute Cholesky and its inverse
+        R = chol(refCOV_reg);
+        R_inv = inv(R);
+        R_inv_T = R_inv';
+        
+        % 2. Transform generalized eigenvalue problems to standard ones page-wise
+        C = pagemtimes(pagemtimes(R_inv_T, COV), R_inv);
+        C = (C + permute(C, [2, 1, 3])) / 2; % Ensure perfect symmetry
+        
+        C_2 = pagemtimes(pagemtimes(R_inv_T, COV_2), R_inv);
+        C_2 = (C_2 + permute(C_2, [2, 1, 3])) / 2;
+        
+        % 3. Solve standard eigenvalue problem in one vectorized page-wise call
+        [Y, D_vec] = pageeig(C, 'nobalance', 'vector');
+        [Y_2, D_vec_2] = pageeig(C_2, 'nobalance', 'vector');
+        
+        % Sort standard eigenvalues page-wise in ascending order (to match eig behavior)
+        [D_vec_sorted, idx] = sort(real(D_vec), 1, 'ascend');
+        [D_vec_2_sorted, idx_2] = sort(real(D_vec_2), 1, 'ascend');
+        
+        % Sort eigenvectors accordingly for each page
+        for i = 1:N_epochs
+            Y(:,:,i) = Y(:, idx(:, 1, i), i);
+        end
+        for i = 1:N_epochs-1
+            Y_2(:,:,i) = Y_2(:, idx_2(:, 1, i), i);
+        end
+        
+        % 4. Transform eigenvectors back
+        Evec = pagemtimes(R_inv, Y);
+        Evec = real(Evec);
+        
+        Evec_2 = pagemtimes(R_inv, Y_2);
+        Evec_2 = real(Evec_2);
+        
+        % 5. Construct 3D diagonal eigenvalue matrices for compatibility
+        Eval = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
+        for i = 1:N_epochs
+            Eval(:,:,i) = diag(D_vec_sorted(:, 1, i));
+        end
+        
+        Eval_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
+        for i = 1:N_epochs-1
+            Eval_2(:,:,i) = diag(D_vec_2_sorted(:, 1, i));
+        end
+        
+        success_pageeig = true;
+    catch
+        success_pageeig = false;
+    end
 end
-COV(:,:,N_epochs) = (COV(:,:,N_epochs) + COV(:,:,N_epochs)') / 2;
-[Evec(:,:,N_epochs), Eval(:,:,N_epochs)] = eig(COV(:,:,N_epochs), refCOV_reg, 'chol');
+
+if ~success_pageeig
+    Evec = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
+    Eval = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
+    Evec_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
+    Eval_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
+    for i=1:N_epochs-1
+        COV(:,:,i) = (COV(:,:,i) + COV(:,:,i)') / 2;
+        [Evec(:,:,i), Eval(:,:,i)] = eig(COV(:,:,i), refCOV_reg, 'chol');
+        COV_2(:,:,i) = (COV_2(:,:,i) + COV_2(:,:,i)') / 2;
+        [Evec_2(:,:,i), Eval_2(:,:,i)] = eig(COV_2(:,:,i), refCOV_reg, 'chol');
+    end
+    COV(:,:,N_epochs) = (COV(:,:,N_epochs) + COV(:,:,N_epochs)') / 2;
+    [Evec(:,:,N_epochs), Eval(:,:,N_epochs)] = eig(COV(:,:,N_epochs), refCOV_reg, 'chol');
+end
 
 
 %% Determine Artifact Threshold and Clean EEG
