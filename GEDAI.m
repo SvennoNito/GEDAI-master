@@ -108,7 +108,7 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel]=GEDAI(EEGin, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, varargin)
+function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel]=GEDAI(EEGin, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, broadband_epoch_size, varargin)
 
 if nargin < 2 || isempty(artifact_threshold_type)
     artifact_threshold_type = 'auto';
@@ -145,6 +145,9 @@ if nargin < 10 || isempty(signal_type)
 end
 if nargin < 11 || isempty(smoothing_window_seconds)
     smoothing_window_seconds = Inf; % default: use whole file (no sliding window)
+end
+if nargin < 12 || isempty(broadband_epoch_size)
+    broadband_epoch_size = 2; % default: use whole file (no sliding window)
 end
 % Validate signal_type
 if ~ismember(lower(signal_type), {'eeg', 'meg'})
@@ -365,7 +368,7 @@ if EEGin.trials > 1 && ndims(EEGin.data) == 3
 end
 
 % -- Ensure epoch size results in an even number of samples (for broadband)
- broadband_epoch_size = 2; % Note: IN SECONDS (this is now only the DEFAULT for broadband)
+%  broadband_epoch_size = 2; % Note: IN SECONDS (this is now only the DEFAULT for broadband)
 if rem(broadband_epoch_size*EEGin.srate, 2) ~= 0
     ideal_total_samples_double = broadband_epoch_size * EEGin.srate;
     nearest_integer_samples = round(ideal_total_samples_double);
@@ -387,7 +390,7 @@ EEGin.data=double(EEGin.data);
 %% Pre-processing
 if strcmp(signal_type, 'eeg')
     % Check if data is already average referenced (Standard or via EEGLAB metadata)
-    is_standard_avg_ref = max(abs(mean(EEGin.data, 1))) < 1e-5;
+    is_standard_avg_ref = max(abs(sum(EEGin.data, 1) / (size(EEGin.data, 1) + 1))) < 1e-5;
        
     if is_standard_avg_ref 
         disp([newline 'Data is already average referenced. Skipping internal average referencing.']);
@@ -780,7 +783,7 @@ if ~parallel || ~success_parallel
             % Determine minThreshold based on signal type and frequency
             current_center_freq = center_frequencies(f);
             current_minThreshold = 0;
-            if (current_center_freq >= 7 && current_center_freq <= 13)
+            if (current_center_freq >= 0.5 && current_center_freq <= 60)
                 current_minThreshold = -6;
             end
             
@@ -818,7 +821,7 @@ if ~parallel || ~success_parallel
             % Determine minThreshold based on signal type and frequency
             current_center_freq = center_frequencies(f);
             current_minThreshold = 0;
-            if strcmpi(signal_type, 'meg') && (current_center_freq >= 7 && current_center_freq <= 13)
+            if strcmpi(signal_type, 'meg') && (current_center_freq >= 0.5 && current_center_freq <= 60)
                 current_minThreshold = -6;
             end
             
