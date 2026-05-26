@@ -48,34 +48,26 @@ num_epochs = size(cov_signal_epoched, 3);
 SIGNAL_subspace_similarity_distribution = zeros(1, num_epochs);
 NOISE_subspace_similarity_distribution = zeros(1, num_epochs);
 
-% Change D: raised crossover to 300 — for n=256, full eig (LAPACK dsyevd) has lower
-% per-call overhead than eigs (ARPACK+Lanczos setup), so it's faster for typical EEG sizes.
-use_full_eig = (num_chans <= 300);
+% Fast Subspace Iteration Setup (2-step Subspace Iteration)
+M = min(size(evecs_Template_cov, 2), SSI_top_PCs);
+Template_guess = evecs_Template_cov(:, 1:M);
 
 for epoch = 1:num_epochs
-    % SIGNAL SUBSPACE similarity
+    % SIGNAL SUBSPACE similarity via 2-step Fast Subspace Iteration
     cov_signal = cov_signal_epoched(:,:,epoch);
-    if use_full_eig
-        [Vs, Ds] = eig(cov_signal);
-        [~, idx] = sort(diag(Ds), 'descend');
-        evecs_signal = Vs(:, idx(1:SSI_top_PCs));
-    else
-        [evecs_signal, ~] = eigs(cov_signal, SSI_top_PCs);
-    end
+    Y1_sig = cov_signal * Template_guess;
+    [Q1_sig, ~] = qr(Y1_sig, 0);
+    Y2_sig = cov_signal * Q1_sig;
+    [evecs_signal, ~] = qr(Y2_sig, 0);
     SIGNAL_subspace_similarity_distribution(epoch) = prod(subspace_angles(evecs_signal, evecs_Template_cov));
 
-    
-    % NOISE SUBSPACE similarity
+    % NOISE SUBSPACE similarity via 2-step Fast Subspace Iteration
     cov_noise = cov_noise_epoched(:,:,epoch);
-    if use_full_eig
-        [Vn, Dn] = eig(cov_noise);
-        [~, idx] = sort(diag(Dn), 'descend');
-        evecs_noise = Vn(:, idx(1:SSI_top_PCs));
-    else
-        [evecs_noise, ~] = eigs(cov_noise, SSI_top_PCs);
-    end
+    Y1_noise = cov_noise * Template_guess;
+    [Q1_noise, ~] = qr(Y1_noise, 0);
+    Y2_noise = cov_noise * Q1_noise;
+    [evecs_noise, ~] = qr(Y2_noise, 0);
     NOISE_subspace_similarity_distribution(epoch) = prod(subspace_angles(evecs_noise, evecs_Template_cov));
-
 end
 
 %% Compute SENSAI Score

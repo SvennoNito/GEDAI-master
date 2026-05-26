@@ -395,13 +395,18 @@ if strcmp(signal_type, 'eeg')
     if is_standard_avg_ref 
         disp([newline 'Data is already average referenced. Skipping internal average referencing.']);
         EEGavRef = EEGin;
+
+    elseif max(abs(sum(EEGin.data, 1) / (size(EEGin.data, 1) + 1))) < 1e-5
+        % Corrected: Removed assignment and evaluated the math directly
+        disp([newline 'Data matches non rank-deficient average reference definition. Skipping internal average referencing.']);
+        EEGavRef = EEGin;
+        
     else
-        EEGavRef = GEDAI_nonRankDeficientAveRef(EEGin); % non rank-deficient average referencing (Makoto's plugin)
-    end
-else
-    % For MEG, skip average referencing
-    EEGavRef = EEGin;
+        EEGavRef = GEDAI_nonRankDeficientAveRef(EEGin); % non rank-deficient average referencing
+    end 
+    
 end
+
 
 %% Create Reference Covariance Matrix (refCOV)
 
@@ -736,7 +741,7 @@ if parallel
             % Determine minThreshold based on signal type and frequency
             current_center_freq = center_frequencies(f);
             current_minThreshold = 0;
-            if (current_center_freq >= 0.5 && current_center_freq <= 60)
+            if (current_center_freq >= 0.8 && current_center_freq <= 60)
                 current_minThreshold = -6;
             end
 
@@ -821,7 +826,7 @@ if ~parallel || ~success_parallel
             % Determine minThreshold based on signal type and frequency
             current_center_freq = center_frequencies(f);
             current_minThreshold = 0;
-            if strcmpi(signal_type, 'meg') && (current_center_freq >= 0.5 && current_center_freq <= 60)
+            if (current_center_freq >= 0.5 && current_center_freq <= 60)
                 current_minThreshold = -6;
             end
             
@@ -1186,7 +1191,7 @@ end
         % Ensure visualization uses the same PC count as the SENSAI scoring logic
         if strcmpi(signal_type, 'meg'), vis_pcs = 4; else, vis_pcs = 3; end
         
-        visualization_metrics = SENSAI_visualization(EEGavRef, EEGclean, EEGartifacts, refCOV, sensai_epoch_size, signal_type, vis_pcs, artifact_threshold_type, smoothing_window_seconds, SENSAI_score);
+        visualization_metrics = SENSAI_visualization(EEGavRef, EEGclean, EEGartifacts, refCOV, sensai_epoch_size, signal_type, vis_pcs, artifact_threshold_type, smoothing_window_seconds, SENSAI_score, mean_ENOVA);
         
         % Store metrics in EEG.etc.GEDAI
         EEGclean.etc.GEDAI.visualization_metrics = visualization_metrics;

@@ -55,7 +55,7 @@ T1 = correction_factor * (105 - artifact_threshold_in) / 100;
 
 %% Defining artifact threshold
     if strcmpi(signal_type, 'eeg')
-       percentile_threshold = 96;
+       percentile_threshold = 98;
       
     elseif strcmpi(signal_type, 'meg')
            percentile_threshold = 99;
