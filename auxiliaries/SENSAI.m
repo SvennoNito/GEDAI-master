@@ -48,8 +48,9 @@ num_epochs = size(cov_signal_epoched, 3);
 SIGNAL_subspace_similarity_distribution = zeros(1, num_epochs);
 NOISE_subspace_similarity_distribution = zeros(1, num_epochs);
 
-% Use eig (full) for small matrices (<150 ch), eigs for large (benchmark crossover ~150-200)
-use_full_eig = (num_chans < 150);
+% Change D: raised crossover to 300 — for n=256, full eig (LAPACK dsyevd) has lower
+% per-call overhead than eigs (ARPACK+Lanczos setup), so it's faster for typical EEG sizes.
+use_full_eig = (num_chans <= 300);
 
 for epoch = 1:num_epochs
     % SIGNAL SUBSPACE similarity

@@ -67,31 +67,56 @@ shifting = epoch_samples / 2;
 eeg_data_2 = eeg_data(:, (shifting+1):(end-shifting));
 EEGdata_epoched_2 = reshape(eeg_data_2, N_EEG_electrodes, epoch_samples, []);
 [~,~,N_epochs] = size(EEGdata_epoched);
-%% Calculate Covariance Matrix per Epoch
+%% Calculate Covariance Matrix per Epoch (Change C: mini-batched pagemtimes)
 COV = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
 COV_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
-for epo=1:N_epochs-1
-    COV(:,:,epo) = cov(EEGdata_epoched(:,:,epo)');
-    COV_2(:,:,epo) = cov(EEGdata_epoched_2(:,:,epo)');
+cov_chunk_size = 500;
+% Stream 1
+for cs = 1:cov_chunk_size:N_epochs
+    ce = min(cs + cov_chunk_size - 1, N_epochs);
+    chunk = EEGdata_epoched(:,:,cs:ce) - mean(EEGdata_epoched(:,:,cs:ce), 2);
+    COV(:,:,cs:ce) = pagemtimes(chunk, 'none', chunk, 'transpose') / (epoch_samples - 1);
 end
-COV(:,:,N_epochs) = cov(EEGdata_epoched(:,:,N_epochs)');
+% Stream 2
+N_epochs_2 = N_epochs - 1;
+for cs = 1:cov_chunk_size:N_epochs_2
+    ce = min(cs + cov_chunk_size - 1, N_epochs_2);
+    chunk_2 = EEGdata_epoched_2(:,:,cs:ce) - mean(EEGdata_epoched_2(:,:,cs:ce), 2);
+    COV_2(:,:,cs:ce) = pagemtimes(chunk_2, 'none', chunk_2, 'transpose') / (epoch_samples - 1);
+end
 %% Generalized Eigendecomposition (GEVD)
 regularization_lambda = 0.05;
 reg_val = trace(refCOV) / N_EEG_electrodes;
 refCOV_reg = (1-regularization_lambda)*refCOV + regularization_lambda*reg_val*eye(N_EEG_electrodes, 'like', refCOV);
 refCOV_reg = (refCOV_reg + refCOV_reg') / 2;
+% Change B: Cholesky factored once; each epoch uses triangular solves (O(n^2))
+% instead of a full Cholesky per epoch (O(n^3/3)) inside eig(A,B,'chol').
+% GEVD A*v = lambda*B*v with B=R'R -> standard eig of (R^{-T}*A*R^{-1}); back-transform V=R\U.
+R_chol = chol(refCOV_reg); % upper triangular: R_chol'*R_chol = refCOV_reg
 Evec = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
 Eval = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
 Evec_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
 Eval_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
 for i=1:N_epochs-1
-    COV(:,:,i) = (COV(:,:,i) + COV(:,:,i)') / 2;
-    [Evec(:,:,i), Eval(:,:,i)] = eig(COV(:,:,i), refCOV_reg, 'chol');
-    COV_2(:,:,i) = (COV_2(:,:,i) + COV_2(:,:,i)') / 2;
-    [Evec_2(:,:,i), Eval_2(:,:,i)] = eig(COV_2(:,:,i), refCOV_reg, 'chol');
+    A = (COV(:,:,i) + COV(:,:,i)') / 2;
+    A_white = (R_chol' \ A) / R_chol;
+    A_white = (A_white + A_white') / 2;
+    [U, D] = eig(A_white);
+    Evec(:,:,i) = R_chol \ U;
+    Eval(:,:,i) = D;
+    A2 = (COV_2(:,:,i) + COV_2(:,:,i)') / 2;
+    A2_white = (R_chol' \ A2) / R_chol;
+    A2_white = (A2_white + A2_white') / 2;
+    [U2, D2] = eig(A2_white);
+    Evec_2(:,:,i) = R_chol \ U2;
+    Eval_2(:,:,i) = D2;
 end
-COV(:,:,N_epochs) = (COV(:,:,N_epochs) + COV(:,:,N_epochs)') / 2;
-[Evec(:,:,N_epochs), Eval(:,:,N_epochs)] = eig(COV(:,:,N_epochs), refCOV_reg, 'chol');
+A = (COV(:,:,N_epochs) + COV(:,:,N_epochs)') / 2;
+A_white = (R_chol' \ A) / R_chol;
+A_white = (A_white + A_white') / 2;
+[U, D] = eig(A_white);
+Evec(:,:,N_epochs) = R_chol \ U;
+Eval(:,:,N_epochs) = D;
 
 
 %% Determine Artifact Threshold and Clean EEG
@@ -269,8 +294,8 @@ if isempty(artifact_threshold_2)
     artifact_threshold_2 = artifact_threshold; % Fallback for 1-epoch edge case
 end
 
-[cleaned_data_1, artifacts_data_1, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold, refCOV, Eval, Evec, cosine_weights, signal_type);
-[cleaned_data_2, artifacts_data_2, ~] = clean_EEG(EEGdata_epoched_2, srate, epoch_size, artifact_threshold_2, refCOV, Eval_2, Evec_2, cosine_weights, signal_type);
+[cleaned_data_1, artifacts_data_1, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold, refCOV, Eval, Evec, cosine_weights, signal_type, refCOV_reg);
+[cleaned_data_2, artifacts_data_2, ~] = clean_EEG(EEGdata_epoched_2, srate, epoch_size, artifact_threshold_2, refCOV, Eval_2, Evec_2, cosine_weights, signal_type, refCOV_reg);
 
 % Clear Stream 2 inputs as they are no longer needed
 clear EEGdata_epoched_2 Evec_2 Eval_2 COV_2;

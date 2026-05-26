@@ -11,7 +11,7 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [cleaned_data, artifacts_data, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold_in, refCOV, Eval, Evec, cosine_weights, signal_type)
+function [cleaned_data, artifacts_data, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold_in, refCOV, Eval, Evec, cosine_weights, signal_type, refCOV_reg_in)
 %   This GEDAI function reconstructs the signal after removing artifactual components
 
 % --- PRE-ALLOCATION ---
@@ -55,7 +55,21 @@ global_log_prctile = prctile(log_Eig_val_all, percentile_threshold);
 Treshold1_array = T1_array * global_log_prctile;
 
 
-%% Cleaning EEG by removing outlying GEVD components
+%% Compute refCOV_reg for B-orthogonal reconstruction (Change A)
+% V^{-T} = refCOV_reg * V  (from GEVD B-orthogonality: V'*B*V = I)
+% This replaces the per-epoch O(n^3) backslash with two O(n^2*T) matrix multiplies.
+if nargin < 10 || isempty(refCOV_reg_in)
+    refCOV_local = real(refCOV);
+    refCOV_local = (refCOV_local + refCOV_local') / 2;
+    reg_lambda = 0.05;
+    reg_val_local = trace(refCOV_local) / num_chans;
+    refCOV_reg = (1-reg_lambda)*refCOV_local + reg_lambda*reg_val_local*eye(num_chans, 'like', refCOV_local);
+    refCOV_reg = (refCOV_reg + refCOV_reg') / 2;
+else
+    refCOV_reg = refCOV_reg_in;
+end
+
+%% Cleaning EEG by removing outlying GEVD components (Change A: mini-batched pagemtimes)
 epoch_samples = round(srate * epoch_size);
 artifacts = zeros(size(EEGdata_epoched), 'like', EEGdata_epoched);
 cleaned_epoched_data = zeros(size(EEGdata_epoched), 'like', EEGdata_epoched);
@@ -64,38 +78,42 @@ if nargin < 8 || isempty(cosine_weights)
 end
 half_epoch = epoch_samples/2;
 
-for i = 1:num_epochs
-    component_spatial_filter = Evec(:,:,i);
-    
-    % --- OPTIMIZATION START ---
-    % 1. Create a logical mask of indices to zero out
-    % (We zero out the SIGNAL components to reconstruct the NOISE to subtract)
-    signal_indices = abs(diag(Eval(:,:,i))) < exp(Treshold1_array(i) - 100);
-    
-    % 2. Apply the mask (Vectorized)
-    component_spatial_filter(:, signal_indices) = 0;
-    % --- OPTIMIZATION END ---
+eeg_chunk_size = 500;
+for chunk_start = 1:eeg_chunk_size:num_epochs
+    chunk_end = min(chunk_start + eeg_chunk_size - 1, num_epochs);
 
-    artifacts_timecourses = component_spatial_filter' * EEGdata_epoched(:,:,i);    
-    Signal_to_remove = Evec(:,:,i)' \ artifacts_timecourses;
-    
-    artifacts(:, :, i) = Signal_to_remove;
-    cleaned_epoch = EEGdata_epoched(:,:,i) - Signal_to_remove;
-    
-    % Apply cosine windowing to mitigate edge effects from epoching
-    if i == 1
-        cleaned_epoch(:, half_epoch+1:end) = cleaned_epoch(:, half_epoch+1:end) .* cosine_weights(:, half_epoch+1:end);
-        artifacts(:, :, i) = artifacts(:, :, i); % Copy first
-        artifacts(:, half_epoch+1:end, i) = artifacts(:, half_epoch+1:end, i) .* cosine_weights(:, half_epoch+1:end);
-    elseif i == num_epochs
-        cleaned_epoch(:, 1:half_epoch) = cleaned_epoch(:, 1:half_epoch) .* cosine_weights(:, 1:half_epoch);
-        artifacts(:, 1:half_epoch, i) = artifacts(:, 1:half_epoch, i) .* cosine_weights(:, 1:half_epoch);
-    else
-        cleaned_epoch = cleaned_epoch .* cosine_weights;
-        artifacts(:, :, i) = artifacts(:, :, i) .* cosine_weights;
+    % Batch project all epochs in chunk: Evec' * data (N x T x K)
+    proj_chunk = pagemtimes(Evec(:,:,chunk_start:chunk_end), 'transpose', ...
+                             EEGdata_epoched(:,:,chunk_start:chunk_end), 'none');
+
+    for k = 1:(chunk_end - chunk_start + 1)
+        i = chunk_start + k - 1;
+
+        % Keep only artifact-component activations (zero out signal rows)
+        signal_indices = abs(diag(Eval(:,:,i))) < exp(Treshold1_array(i) - 100);
+        proj = proj_chunk(:,:,k);
+        proj(signal_indices, :) = 0;
+
+        % B-orthogonal solve: V^{-T} * proj = refCOV_reg * V * proj
+        Signal_to_remove = refCOV_reg * (Evec(:,:,i) * proj);
+
+        artifacts(:,:,i) = Signal_to_remove;
+        cleaned_epoch = EEGdata_epoched(:,:,i) - Signal_to_remove;
+
+        % Apply cosine windowing to mitigate edge effects from epoching
+        if i == 1
+            cleaned_epoch(:, half_epoch+1:end) = cleaned_epoch(:, half_epoch+1:end) .* cosine_weights(:, half_epoch+1:end);
+            artifacts(:, half_epoch+1:end, i) = artifacts(:, half_epoch+1:end, i) .* cosine_weights(:, half_epoch+1:end);
+        elseif i == num_epochs
+            cleaned_epoch(:, 1:half_epoch) = cleaned_epoch(:, 1:half_epoch) .* cosine_weights(:, 1:half_epoch);
+            artifacts(:, 1:half_epoch, i) = artifacts(:, 1:half_epoch, i) .* cosine_weights(:, 1:half_epoch);
+        else
+            cleaned_epoch = cleaned_epoch .* cosine_weights;
+            artifacts(:,:,i) = artifacts(:,:,i) .* cosine_weights;
+        end
+
+        cleaned_epoched_data(:,:,i) = cleaned_epoch;
     end
-    
-    cleaned_epoched_data(:,:,i) = cleaned_epoch;
 end
 
 % Reshape data back to continuous form and return outputs
