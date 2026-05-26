@@ -70,7 +70,11 @@
 %   smoothing_window_seconds    - Window size (in seconds) for sliding threshold adaptation 
 %                                 to account for signal non-stationarities over time. 
 %                                 Set to Inf (default) to use a fixed global threshold.
-%    
+%
+%   broadband_only              - Boolean. If true, only the broadband denoising pass is
+%                                 run, skipping wavelet band decomposition. Faster but
+%                                 less thorough. Default is false.
+%
 % Outputs:
 % 
 %   EEGclean                - Cleaned EEG data in EEGLab struct format
@@ -108,7 +112,7 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel]=GEDAI(EEGin, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, broadband_epoch_size, varargin)
+function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel]=GEDAI(EEGin, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, broadband_epoch_size, broadband_only, varargin)
 
 if nargin < 2 || isempty(artifact_threshold_type)
     artifact_threshold_type = 'auto';
@@ -148,6 +152,9 @@ if nargin < 11 || isempty(smoothing_window_seconds)
 end
 if nargin < 12 || isempty(broadband_epoch_size)
     broadband_epoch_size = 2; % default: use whole file (no sliding window)
+end
+if nargin < 13 || isempty(broadband_only)
+    broadband_only = false;
 end
 % Validate signal_type
 if ~ismember(lower(signal_type), {'eeg', 'meg'})
@@ -200,7 +207,7 @@ if ENOVA_threshold_per_channel < inf
     
     % Run GEDAI with channel rejection disabled (inf) to identify bad channels
     % Also disable epoch rejection in pass 1 so channel variance isn't computed on incomplete data
-    [~, ~, ~, ~, ~, mean_ENOVA_p1, ENOVA_per_epoch_p1, ~, ~, ENOVA_per_channel_val_p1] = GEDAI(EEG_p1, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_p1, parallel, false, inf, inf, signal_type, false, smoothing_window_seconds);
+    [~, ~, ~, ~, ~, mean_ENOVA_p1, ENOVA_per_epoch_p1, ~, ~, ENOVA_per_channel_val_p1] = GEDAI(EEG_p1, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_p1, parallel, false, inf, inf, signal_type, false, smoothing_window_seconds, false);
     
     clear EEGclean_p1 EEGartifacts_p1; % Free memory
     
@@ -240,7 +247,7 @@ if ENOVA_threshold_per_channel < inf
         % --- PASS 2 ---
         disp([newline '--- PASS 2: Processing reduced data with global epoch thresholds ---']);
         [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band] = ...
-            GEDAI(EEG_reduced, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_reduced, parallel, false, ENOVA_threshold_per_epoch, inf, signal_type, smoothing_window_seconds, ENOVA_per_epoch_p1);
+            GEDAI(EEG_reduced, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_reduced, parallel, false, ENOVA_threshold_per_epoch, inf, signal_type, smoothing_window_seconds, ENOVA_per_epoch_p1, false);
         
         % --- INTERPOLATION ---
         disp([newline '--- INTERPOLATING BAD CHANNELS ---']);
@@ -619,8 +626,15 @@ end
     artifact_threshold_array_per_band = {broadband_thresh};
     ENOVA_per_band = broadband_ENOVA;
 
-
-
+if broadband_only
+    disp('Broadband-only mode: skipping wavelet band decomposition.');
+    num_bands_to_process = 0;
+    lower_frequencies = [];
+    upper_frequencies = [];
+    epoch_sizes_per_wavelet_band = [];
+    wavelet_band_filtered_data = cleaned_broadband_data;
+    clear cleaned_broadband_data;
+else
 
 %% Second pass: Wavelet decomposition and per-band denoising
 % MEMORY OPTIMIZED: Use incremental band processing instead of full decomposition
@@ -848,6 +862,8 @@ end
 
 % MEMORY OPTIMIZED: Clear unfiltered data after all wavelet processing
 clear unfiltered_data;
+
+end % broadband_only
 
 %% Finalization: Reconstruct EEG and calculate final scores
 % MEMORY OPTIMIZED: Data already accumulated in 2D array, no summation needed
