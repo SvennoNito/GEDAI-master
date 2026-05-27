@@ -1,4 +1,4 @@
-function [cov_signal_epoched, cov_noise_epoched, artifact_threshold_out,Treshold1] = clean_SENSAI(artifact_threshold_in, refCOV, Eval, Evec, cov_total, signal_type)
+function [cov_signal_epoched, cov_noise_epoched, artifact_threshold_out,Treshold1] = clean_SENSAI(artifact_threshold_in, refCOV, Eval, Evec, cov_total, signal_type, percentile_threshold)
 %   This GEDAI function estimates signal and noise covariances analytically
 %%   Creative Commons License
 %
@@ -54,12 +54,13 @@ log_Eig_val_all = log(magnitudes(magnitudes > 0)) + 100;
 T1 = correction_factor * (105 - artifact_threshold_in) / 100;
 
 %% Defining artifact threshold
+if nargin < 7 || isempty(percentile_threshold)
     if strcmpi(signal_type, 'eeg')
-       percentile_threshold = 98;
-      
+        percentile_threshold = 98;
     elseif strcmpi(signal_type, 'meg')
-           percentile_threshold = 99;
+        percentile_threshold = 99;
     end
+end
 Treshold1 = T1 * prctile(log_Eig_val_all, percentile_threshold);
 
 

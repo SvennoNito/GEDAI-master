@@ -11,7 +11,7 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [cleaned_data, artifacts_data, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold_in, refCOV, Eval, Evec, cosine_weights, signal_type, refCOV_reg_in)
+function [cleaned_data, artifacts_data, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold_in, refCOV, Eval, Evec, cosine_weights, signal_type, refCOV_reg_in, percentile_threshold)
 %   This GEDAI function reconstructs the signal after removing artifactual components
 
 % --- PRE-ALLOCATION ---
@@ -39,13 +39,13 @@ end
 T1_array = correction_factor * (105 - artifact_threshold_in) / 100;
 
 %% Defining artifact threshold
-
+if nargin < 11 || isempty(percentile_threshold)
     if strcmpi(signal_type, 'eeg')
-       percentile_threshold = 98;
-      
+        percentile_threshold = 98;
     elseif strcmpi(signal_type, 'meg')
-           percentile_threshold = 99;
+        percentile_threshold = 99;
     end
+end
 
 % Compute Treshold1 per epoch to match exactly how clean_SENSAI evaluates it:
 % SENSAI uses the GLOBAL percentile of ALL eigenvalues in the window it was
