@@ -892,16 +892,20 @@ EEGartifacts.data = EEGavRef.data(:, 1:size(EEGclean.data, 2)) - EEGclean.data;
 % Calculate composite SENSAI score for epoch rejection
 noise_multiplier = 1;
 sensai_epoch_size = 1;
-[SENSAI_score, ~, ~, mean_ENOVA, ENOVA_per_epoch_internal] = SENSAI_basic(double(EEGclean.data), double(EEGartifacts.data), EEGavRef.srate, sensai_epoch_size, refCOV, noise_multiplier, signal_type);
-
-if ~isempty(precomputed_ENOVA_per_epoch)
-    ENOVA_per_epoch = precomputed_ENOVA_per_epoch;
+if ENOVA_threshold_per_epoch < inf
+    [SENSAI_score, ~, ~, mean_ENOVA, ENOVA_per_epoch_internal] = SENSAI_basic(double(EEGclean.data), double(EEGartifacts.data), EEGavRef.srate, sensai_epoch_size, refCOV, noise_multiplier, signal_type);
+    if ~isempty(precomputed_ENOVA_per_epoch)
+        ENOVA_per_epoch = precomputed_ENOVA_per_epoch;
+    else
+        ENOVA_per_epoch = ENOVA_per_epoch_internal;
+    end
 else
-    ENOVA_per_epoch = ENOVA_per_epoch_internal;
+    ENOVA_per_epoch = [];
 end
 
 % Store original epoch count for rejection statistics
-original_total_epochs = length(ENOVA_per_epoch);
+epoch_samples_for_count = round(sensai_epoch_size * EEGavRef.srate);
+original_total_epochs = max(length(ENOVA_per_epoch), floor(size(EEGclean.data, 2) / epoch_samples_for_count));
 
 % Calculate ENOVA per channel as a mean across epochs
 epoch_samples = round(sensai_epoch_size * EEGavRef.srate);
