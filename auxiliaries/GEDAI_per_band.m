@@ -227,7 +227,9 @@ for w = 1:num_windows
     
     switch optimization_type
         case 'parabolic'
+            tFminbnd = tic;
             [optimal_artifact_threshold] = SENSAI_fminbnd(minThreshold, maxThreshold, refCOV, Eval_sub, Evec_sub, noise_multiplier, COV_sub, evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold);
+            fprintf('  SENSAI_fminbnd (window %d/%d): %.2f s\n', w, num_windows, toc(tFminbnd));
         
         case 'grid' % Restored grid search functionality
             automatic_thresholding_step_size = 1/3;
@@ -297,8 +299,12 @@ if isempty(artifact_threshold_2)
     artifact_threshold_2 = artifact_threshold; % Fallback for 1-epoch edge case
 end
 
+tClean1 = tic;
 [cleaned_data_1, artifacts_data_1, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold, refCOV, Eval, Evec, cosine_weights, signal_type, refCOV_reg, percentile_threshold);
+fprintf('  clean_EEG (stream 1): %.2f s\n', toc(tClean1));
+tClean2 = tic;
 [cleaned_data_2, artifacts_data_2, ~] = clean_EEG(EEGdata_epoched_2, srate, epoch_size, artifact_threshold_2, refCOV, Eval_2, Evec_2, cosine_weights, signal_type, refCOV_reg, percentile_threshold);
+fprintf('  clean_EEG (stream 2): %.2f s\n', toc(tClean2));
 
 % Clear Stream 2 inputs as they are no longer needed
 clear EEGdata_epoched_2 Evec_2 Eval_2 COV_2;

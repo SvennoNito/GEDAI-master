@@ -54,6 +54,14 @@ end
 global_log_prctile = prctile(log_Eig_val_all, percentile_threshold);
 Treshold1_array = T1_array * global_log_prctile;
 
+% %%% Figure?
+% figure('color', 'w')
+% histogram(log_Eig_val_all)
+% xline(prctile(log_Eig_val_all, 96), '-', '95%')
+% xline(prctile(log_Eig_val_all, 98), '-', '98%')
+% xline(prctile(log_Eig_val_all, 99), '-', '99%')
+% xlabel('Eigenvalues (all chans x all epochs)')
+% ylabel('#')
 
 %% Compute refCOV_reg for B-orthogonal reconstruction (Change A)
 % V^{-T} = refCOV_reg * V  (from GEVD B-orthogonality: V'*B*V = I)

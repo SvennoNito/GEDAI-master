@@ -86,6 +86,12 @@
 %                                 Lower values allow more aggressive broadband cleaning.
 %                                 Default is -2.
 %
+%   compute_SENSAI              - Boolean. If true (default), runs SENSAI_basic after
+%                                 cleaning to compute SENSAI_score, mean_ENOVA, and
+%                                 ENOVA_per_epoch. Set to false to skip this step and
+%                                 return NaN for those outputs (useful when scoring will
+%                                 be done externally).
+%
 % Outputs:
 % 
 %   EEGclean                - Cleaned EEG data in EEGLab struct format
@@ -123,7 +129,7 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel]=GEDAI(EEGin, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, broadband_epoch_size, broadband_only, percentile_threshold, broadband_minThreshold, varargin)
+function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel]=GEDAI(EEGin, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, broadband_epoch_size, broadband_only, percentile_threshold, broadband_minThreshold, compute_SENSAI, varargin)
 
 if nargin < 2 || isempty(artifact_threshold_type)
     artifact_threshold_type = 'auto';
@@ -172,6 +178,9 @@ if nargin < 14 || isempty(percentile_threshold)
 end
 if nargin < 15 || isempty(broadband_minThreshold)
     broadband_minThreshold = -2;
+end
+if nargin < 16 || isempty(compute_SENSAI)
+    compute_SENSAI = true;
 end
 % Validate signal_type
 if ~ismember(lower(signal_type), {'eeg', 'meg'})
@@ -224,8 +233,9 @@ if ENOVA_threshold_per_channel < inf
     
     % Run GEDAI with channel rejection disabled (inf) to identify bad channels
     % Also disable epoch rejection in pass 1 so channel variance isn't computed on incomplete data
-    [~, ~, ~, ~, ~, mean_ENOVA_p1, ENOVA_per_epoch_p1, ~, ~, ENOVA_per_channel_val_p1] = GEDAI(EEG_p1, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_p1, parallel, false, inf, inf, signal_type, false, smoothing_window_seconds, false, percentile_threshold, broadband_minThreshold);
-    
+    [~, ~, ~, ~, ~, mean_ENOVA_p1, ENOVA_per_epoch_p1, ~, ~, ENOVA_per_channel_val_p1] = GEDAI(EEG_p1, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_p1, parallel, false, inf, inf, signal_type, smoothing_window_seconds);
+%     [cleaned_broadband_data, ~, broadband_sensai, broadband_thresh, broadband_ENOVA] = GEDAI_per_band(double(EEGavRef.data), EEGavRef.srate, EEGavRef.chanlocs, broadband_artifact_threshold_type, broadband_epoch_size, refCOV, broadband_optimization_type, parallel, signal_type, broadband_minThreshold, broadband_maxThreshold, smoothing_window_seconds, percentile_threshold);
+
     clear EEGclean_p1 EEGartifacts_p1; % Free memory
     
     noisy_channels_p1_idx = find(ENOVA_per_channel_val_p1 > ENOVA_threshold_per_channel);
@@ -264,7 +274,7 @@ if ENOVA_threshold_per_channel < inf
         % --- PASS 2 ---
         disp([newline '--- PASS 2: Processing reduced data with global epoch thresholds ---']);
         [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band] = ...
-            GEDAI(EEG_reduced, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_reduced, parallel, false, ENOVA_threshold_per_epoch, inf, signal_type, smoothing_window_seconds, ENOVA_per_epoch_p1, false, percentile_threshold, broadband_minThreshold);
+            GEDAI(EEG_reduced, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_reduced, parallel, false, ENOVA_threshold_per_epoch, inf, signal_type, smoothing_window_seconds, ENOVA_per_epoch_p1, false, percentile_threshold, broadband_minThreshold, compute_SENSAI);
         
         % --- INTERPOLATION ---
         disp([newline '--- INTERPOLATING BAD CHANNELS ---']);
@@ -635,6 +645,7 @@ end
     disp([newline 'SENSAI threshold detection...please wait']);
     broadband_optimization_type = 'parabolic';
     broadband_artifact_threshold_type = 'auto-';
+%     broadband_artifact_threshold_type = artifact_threshold_type;
     broadband_maxThreshold = 12;
     [cleaned_broadband_data, ~, broadband_sensai, broadband_thresh, broadband_ENOVA] = GEDAI_per_band(double(EEGavRef.data), EEGavRef.srate, EEGavRef.chanlocs, broadband_artifact_threshold_type, broadband_epoch_size, refCOV, broadband_optimization_type, parallel, signal_type, broadband_minThreshold, broadband_maxThreshold, smoothing_window_seconds, percentile_threshold);
     SENSAI_score_per_band = broadband_sensai;
@@ -771,7 +782,7 @@ if parallel
             % Determine minThreshold based on signal type and frequency
             current_center_freq = center_frequencies(f);
             current_minThreshold = 0;
-            if (current_center_freq >= 0.8 && current_center_freq <= 60)
+            if (current_center_freq >= 0.5 && current_center_freq <= 60)
                 current_minThreshold = -6;
             end
 
@@ -892,8 +903,10 @@ EEGartifacts.data = EEGavRef.data(:, 1:size(EEGclean.data, 2)) - EEGclean.data;
 % Calculate composite SENSAI score for epoch rejection
 noise_multiplier = 1;
 sensai_epoch_size = 1;
-if ENOVA_threshold_per_epoch < inf
+if ENOVA_threshold_per_epoch < inf & compute_SENSAI
+    tSensai1 = tic;
     [SENSAI_score, ~, ~, mean_ENOVA, ENOVA_per_epoch_internal] = SENSAI_basic(double(EEGclean.data), double(EEGartifacts.data), EEGavRef.srate, sensai_epoch_size, refCOV, noise_multiplier, signal_type);
+    fprintf('SENSAI_basic (epoch scoring): %.2f s\n', toc(tSensai1));
     if ~isempty(precomputed_ENOVA_per_epoch)
         ENOVA_per_epoch = precomputed_ENOVA_per_epoch;
     else
@@ -1081,7 +1094,15 @@ end
 
 % Calculate final SENSAI score (after potential epoch rejection)
 
-[SENSAI_score, ~, ~, mean_ENOVA, ENOVA_per_epoch] = SENSAI_basic(double(EEGclean.data), double(EEGartifacts.data), EEGavRef.srate, 1, refCOV, noise_multiplier, signal_type);
+if compute_SENSAI
+    tSensai2 = tic;
+    [SENSAI_score, ~, ~, mean_ENOVA, ENOVA_per_epoch] = SENSAI_basic(double(EEGclean.data), double(EEGartifacts.data), EEGavRef.srate, 1, refCOV, noise_multiplier, signal_type);
+    fprintf('SENSAI_basic (final scoring): %.2f s\n', toc(tSensai2));
+else
+    SENSAI_score = NaN;
+    mean_ENOVA   = NaN;
+    ENOVA_per_epoch = [];
+end
 
 % disp([newline 'SENSAI score: ' num2str(round(SENSAI_score, 2, 'significant'))]);
 % disp(['Mean ENOVA: ' num2str(round(mean_ENOVA, 2, 'significant'))]);
