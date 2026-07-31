@@ -129,30 +129,33 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel]=GEDAI(EEGin, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, broadband_epoch_size, broadband_only, percentile_threshold, broadband_minThreshold, compute_SENSAI, varargin)
+function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel]=GEDAI(EEGin, artifact_threshold_type, broadband_artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, broadband_epoch_size, broadband_only, percentile_threshold, broadband_minThreshold, compute_SENSAI, varargin)
 
 if nargin < 2 || isempty(artifact_threshold_type)
     artifact_threshold_type = 'auto';
 end
-if nargin < 3 || isempty(epoch_size_in_cycles)
+if nargin < 3 || isempty(broadband_artifact_threshold_type)
+    broadband_artifact_threshold_type = 'auto-';
+end
+if nargin < 4 || isempty(epoch_size_in_cycles)
     epoch_size_in_cycles = 12;  % Note: Number of wave CYCLES per epoch across wavelet bands (default = 12 cycles)
 end
-if nargin < 4 || isempty(lowcut_frequency)
+if nargin < 5 || isempty(lowcut_frequency)
     lowcut_frequency = 0.5; %  exclude all wavelet bands below this frequency (default = 0.5 Hz)
 end
-if nargin < 5 || isempty(ref_matrix_type)
+if nargin < 6 || isempty(ref_matrix_type)
     ref_matrix_type = 'precomputed';
 end
-if nargin < 6 || isempty(parallel)
+if nargin < 7 || isempty(parallel)
     parallel = true;
 end
-if nargin < 7 || isempty(visualize_artifacts)
+if nargin < 8 || isempty(visualize_artifacts)
     visualize_artifacts = false;
 end
-if nargin < 8 || isempty(ENOVA_threshold_per_epoch)
+if nargin < 9 || isempty(ENOVA_threshold_per_epoch)
     ENOVA_threshold_per_epoch = inf; % If empty, set to infinity to disable rejection
 end
-if nargin < 9 || isempty(ENOVA_threshold_per_channel)
+if nargin < 10 || isempty(ENOVA_threshold_per_channel)
     ENOVA_threshold_per_channel = inf; % If empty, set to infinity to disable rejection
 end
 
@@ -161,25 +164,25 @@ precomputed_ENOVA_per_epoch = [];
 if ~isempty(varargin)
     precomputed_ENOVA_per_epoch = varargin{1};
 end
-if nargin < 10 || isempty(signal_type)
+if nargin < 11 || isempty(signal_type)
     signal_type = 'eeg';
 end
-if nargin < 11 || isempty(smoothing_window_seconds)
+if nargin < 12 || isempty(smoothing_window_seconds)
     smoothing_window_seconds = Inf; % default: use whole file (no sliding window)
 end
-if nargin < 12 || isempty(broadband_epoch_size)
+if nargin < 13 || isempty(broadband_epoch_size)
     broadband_epoch_size = 2; % default: use whole file (no sliding window)
 end
-if nargin < 13 || isempty(broadband_only)
+if nargin < 14 || isempty(broadband_only)
     broadband_only = false;
 end
-if nargin < 14 || isempty(percentile_threshold)
+if nargin < 15 || isempty(percentile_threshold)
     percentile_threshold = []; % default: auto-derived from signal_type in clean_EEG / clean_SENSAI
 end
-if nargin < 15 || isempty(broadband_minThreshold)
+if nargin < 16 || isempty(broadband_minThreshold)
     broadband_minThreshold = -2;
 end
-if nargin < 16 || isempty(compute_SENSAI)
+if nargin < 17 || isempty(compute_SENSAI)
     compute_SENSAI = true;
 end
 % Validate signal_type
@@ -233,7 +236,7 @@ if ENOVA_threshold_per_channel < inf
     
     % Run GEDAI with channel rejection disabled (inf) to identify bad channels
     % Also disable epoch rejection in pass 1 so channel variance isn't computed on incomplete data
-    [~, ~, ~, ~, ~, mean_ENOVA_p1, ENOVA_per_epoch_p1, ~, ~, ENOVA_per_channel_val_p1] = GEDAI(EEG_p1, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_p1, parallel, false, inf, inf, signal_type, smoothing_window_seconds);
+    [~, ~, ~, ~, ~, mean_ENOVA_p1, ENOVA_per_epoch_p1, ~, ~, ENOVA_per_channel_val_p1] = GEDAI(EEG_p1, artifact_threshold_type, broadband_artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_p1, parallel, false, inf, inf, signal_type, smoothing_window_seconds);
 %     [cleaned_broadband_data, ~, broadband_sensai, broadband_thresh, broadband_ENOVA] = GEDAI_per_band(double(EEGavRef.data), EEGavRef.srate, EEGavRef.chanlocs, broadband_artifact_threshold_type, broadband_epoch_size, refCOV, broadband_optimization_type, parallel, signal_type, broadband_minThreshold, broadband_maxThreshold, smoothing_window_seconds, percentile_threshold);
 
     clear EEGclean_p1 EEGartifacts_p1; % Free memory
@@ -274,7 +277,7 @@ if ENOVA_threshold_per_channel < inf
         % --- PASS 2 ---
         disp([newline '--- PASS 2: Processing reduced data with global epoch thresholds ---']);
         [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band] = ...
-            GEDAI(EEG_reduced, artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_reduced, parallel, false, ENOVA_threshold_per_epoch, inf, signal_type, smoothing_window_seconds, ENOVA_per_epoch_p1, false, percentile_threshold, broadband_minThreshold, compute_SENSAI);
+            GEDAI(EEG_reduced, artifact_threshold_type, broadband_artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type_reduced, parallel, false, ENOVA_threshold_per_epoch, inf, signal_type, smoothing_window_seconds, broadband_epoch_size, false, percentile_threshold, broadband_minThreshold, compute_SENSAI, ENOVA_per_epoch_p1);
         
         % --- INTERPOLATION ---
         disp([newline '--- INTERPOLATING BAD CHANNELS ---']);
@@ -330,8 +333,8 @@ if ENOVA_threshold_per_channel < inf
         else
             ref_matrix_type_str = ref_matrix_type;
         end
-        com = sprintf('EEG = GEDAI(EEG, ''%s'', %s,  %s, ''%s'', %d,  %d, %s, %s, ''%s'');', ...
-            artifact_threshold_type, num2str(epoch_size_in_cycles), num2str(lowcut_frequency), ref_matrix_type_str, parallel, visualize_artifacts, num2str(ENOVA_threshold_per_epoch), num2str(ENOVA_threshold_per_channel), signal_type);
+        com = sprintf('EEG = GEDAI(EEG, ''%s'', ''%s'', %s,  %s, ''%s'', %d,  %d, %s, %s, ''%s'');', ...
+            artifact_threshold_type, broadband_artifact_threshold_type, num2str(epoch_size_in_cycles), num2str(lowcut_frequency), ref_matrix_type_str, parallel, visualize_artifacts, num2str(ENOVA_threshold_per_epoch), num2str(ENOVA_threshold_per_channel), signal_type);
         EEGclean = eegh(com, EEGclean);
         
         % --- FINAL VISUALIZATIONS ON FULL INTERPOLATED DATA ---
@@ -644,8 +647,6 @@ end
 
     disp([newline 'SENSAI threshold detection...please wait']);
     broadband_optimization_type = 'parabolic';
-    broadband_artifact_threshold_type = 'auto-';
-%     broadband_artifact_threshold_type = artifact_threshold_type;
     broadband_maxThreshold = 12;
     [cleaned_broadband_data, ~, broadband_sensai, broadband_thresh, broadband_ENOVA] = GEDAI_per_band(double(EEGavRef.data), EEGavRef.srate, EEGavRef.chanlocs, broadband_artifact_threshold_type, broadband_epoch_size, refCOV, broadband_optimization_type, parallel, signal_type, broadband_minThreshold, broadband_maxThreshold, smoothing_window_seconds, percentile_threshold);
     SENSAI_score_per_band = broadband_sensai;
@@ -969,8 +970,8 @@ tEnd = toc(tStart);
 if ~ischar(ref_matrix_type)
     ref_matrix_type = 'custom';
 end
-com = sprintf('EEG = GEDAI(EEG, ''%s'', %s,  %s, ''%s'', %d,  %d, %s, %s, ''%s'');', ...
-    artifact_threshold_type, num2str(epoch_size_in_cycles), num2str(lowcut_frequency), ref_matrix_type, parallel, visualize_artifacts, num2str(ENOVA_threshold_per_epoch), num2str(ENOVA_threshold_per_channel), signal_type);
+com = sprintf('EEG = GEDAI(EEG, ''%s'', ''%s'', %s,  %s, ''%s'', %d,  %d, %s, %s, ''%s'');', ...
+    artifact_threshold_type, broadband_artifact_threshold_type, num2str(epoch_size_in_cycles), num2str(lowcut_frequency), ref_matrix_type, parallel, visualize_artifacts, num2str(ENOVA_threshold_per_epoch), num2str(ENOVA_threshold_per_channel), signal_type);
 
 if visualize_artifacts
     EEGclean_for_vis = EEGclean;
