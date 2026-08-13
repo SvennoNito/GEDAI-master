@@ -1,5 +1,13 @@
-function [cov_signal_epoched, cov_noise_epoched, artifact_threshold_out,Treshold1] = clean_SENSAI(artifact_threshold_in, refCOV, Eval, Evec, cov_total, signal_type, percentile_threshold)
+function [cov_signal_epoched, cov_noise_epoched, artifact_threshold_out, Treshold1] = clean_SENSAI(artifact_threshold_in, refCOV, Evald, Evec, signal_type, percentile_threshold)
 %   This GEDAI function estimates signal and noise covariances analytically
+%
+%   NOTE: SENSAI no longer calls this. It computes the same subspace
+%   similarities without ever materializing cov_signal/cov_noise, which are
+%   two N x N x K arrays. This function is retained for diagnostics and for
+%   callers that genuinely want the covariances themselves.
+%
+%   Evald is r x K (one eigenvalue column per epoch), Evec is N x r x K.
+%
 %%   Creative Commons License
 %
 % Copyright:  Tomas Ros & Abele Michela
@@ -35,119 +43,63 @@ function [cov_signal_epoched, cov_noise_epoched, artifact_threshold_out,Treshold
 % THE POSSIBILITY OF SUCH DAMAGE.
 
 % --- PRE-ALLOCATION ---
-num_chans = size(Eval, 1);
-num_epochs = size(Eval, 3);
-% Pre-allocate the array to its full size with the correct complex type.
-all_diagonals = complex(zeros(num_chans * num_epochs, 1));
-for i = 1:num_epochs
-    start_idx = (i-1) * num_chans + 1;
-    end_idx = i * num_chans;
-    all_diagonals(start_idx:end_idx) = diag(Eval(:,:,i));
-end
-% Use the magnitude (a real value) for all subsequent calculations.
-magnitudes = abs(all_diagonals);
-log_Eig_val_all = log(magnitudes(magnitudes > 0)) + 100;
+num_chans  = size(Evec, 1);
+num_epochs = size(Evec, 3);
+all_evals_mat = abs(Evald);
 
-
-    %% Artifacting multiplication factor T1
-    correction_factor = 1.00;
+%% Artifacting multiplication factor T1
+correction_factor = 1.00;
 T1 = correction_factor * (105 - artifact_threshold_in) / 100;
 
 %% Defining artifact threshold
-if nargin < 7 || isempty(percentile_threshold)
+if nargin < 6 || isempty(percentile_threshold)
     if strcmpi(signal_type, 'eeg')
         percentile_threshold = 98;
     elseif strcmpi(signal_type, 'meg')
         percentile_threshold = 99;
     end
 end
-Treshold1 = T1 * prctile(log_Eig_val_all, percentile_threshold);
-
+[threshold_val, Treshold1] = gedai_eig_threshold(Evald, num_chans, percentile_threshold, T1);
 
 %% Compute Regularized Reference Covariance
 % Replicate logic from GEDAI_per_band.m to ensure we have the correct B for B-orthogonality
-% refCOV argument is the raw reference covariance.
 refCOV = real(refCOV);
 refCOV = (refCOV + refCOV') / 2;
 regularization_lambda = 0.05;
-% Using trace(refCOV)/num_chans is faster than mean(eig(refCOV)) and equivalent for SPD.
 reg_val = trace(refCOV) / num_chans;
 refCOV_reg = (1-regularization_lambda)*refCOV + regularization_lambda*reg_val*eye(num_chans, 'like', refCOV);
 refCOV_reg = (refCOV_reg + refCOV_reg') / 2;
 
-
 %% Cleaning EEG by removing outlying GEVD components
-% Prepare outputs for covariances
-cov_signal_epoched = zeros(num_chans, num_chans, num_epochs, 'like', Eval);
-cov_noise_epoched = zeros(num_chans, num_chans, num_epochs, 'like', Eval);
+cov_signal_epoched = zeros(num_chans, num_chans, num_epochs, 'like', Evald);
+cov_noise_epoched  = zeros(num_chans, num_chans, num_epochs, 'like', Evald);
 
 for i = 1:num_epochs
-    % Determine which components are artifacts based on eigenvalues
-    current_evals = abs(diag(Eval(:,:,i)));
-    threshold_val = exp(Treshold1 - 100);
-    
+    current_evals = all_evals_mat(:, i);
+
     % 'bad_indices' are indices of ARTIFACT components (Large Eigenvalues)
-    % Logic: components with eval >= threshold are artifacts.
     bad_indices = current_evals >= threshold_val;
 
-    %%%% Optimized Covariance Reconstruction %%%%%
-    % Signal = Total - Noise.
-    % Compute Noise Covariance efficiently.
-    
     if any(bad_indices)
-        % Noise Covariance reconstruction
-        % We used to do: V_inv = inv(Evec); V_bad_rows = V_inv(bad_indices, :);
-        % Optimization: V_inv = Evec' * refCOV_reg (due to GEVD properties)
-        % So V_bad_rows = Evec(:, bad_indices, i)' * refCOV_reg
-        % This avoids full matrix inversion and full matrix multiplication!
-        
-        % 1. Get relevant columns of Evec (N x K)
+        % V_inv = Evec' * refCOV_reg (from GEVD B-orthogonality), so the
+        % rows of V_inv for the bad components are Evec(:,bad)' * refCOV_reg.
         Evec_bad = Evec(:, bad_indices, i);
-        
-        % 2. Compute rows of V_inv corresponding to bad indices (K x N)
-        % This is a (K x N) * (N x N) multiplication.
-        % Actually it's (K x N) * (N x N). Wait.
-        % Evec_bad' is (K x N). refCOV_reg is (N x N).
-        % Result V_bad_rows is (K x N).
-        V_bad_rows = Evec_bad' * refCOV_reg; 
-        
+        V_bad_rows = Evec_bad' * refCOV_reg;
         d_bad = current_evals(bad_indices);
-        
-        % 3. Reconstruction: V_bad_rows' * (V_bad_rows .* d_bad)
-        % Result is (N x K) * (K x N) -> (N x N).
         cov_noise_epoched(:,:,i) = V_bad_rows' * (V_bad_rows .* d_bad);
-        
-    else
-        % No artifacts in this epoch
-        % cov_noise_epoched(:,:,i) stays 0
     end
 
-    % Proper Signal Covariance Estimation
     good_indices = ~bad_indices;
-    
     if any(good_indices)
-        % Signal Covariance reconstruction using good components
-        % Similar logic to noise reconstruction above
-        
-        % 1. Get relevant columns of Evec (N x K_good)
         Evec_good = Evec(:, good_indices, i);
-        
-        % 2. Compute rows of V_inv corresponding to good indices (K_good x N)
-        V_good_rows = Evec_good' * refCOV_reg; 
-        
+        V_good_rows = Evec_good' * refCOV_reg;
         d_good = current_evals(good_indices);
-        
-        % 3. Reconstruction: V_good_rows' * (V_good_rows .* d_good)
         cov_signal_epoched(:,:,i) = V_good_rows' * (V_good_rows .* d_good);
-        
-    else
-        % If no good components, signal covariance remains zero
     end
 
     % Enforce symmetry to allow fast symmetric eig solver downstream
-    cov_noise_epoched(:,:,i) = (cov_noise_epoched(:,:,i) + cov_noise_epoched(:,:,i)') / 2;
+    cov_noise_epoched(:,:,i)  = (cov_noise_epoched(:,:,i) + cov_noise_epoched(:,:,i)') / 2;
     cov_signal_epoched(:,:,i) = (cov_signal_epoched(:,:,i) + cov_signal_epoched(:,:,i)') / 2;
-    
 end
 
 artifact_threshold_out = artifact_threshold_in;

@@ -11,23 +11,15 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [cleaned_data, artifacts_data, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold_in, refCOV, Eval, Evec, cosine_weights, signal_type, refCOV_reg_in, percentile_threshold)
+function [cleaned_data, artifacts_data, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold_in, refCOV, Evald, Evec, cosine_weights, signal_type, refCOV_reg_in, percentile_threshold)
 %   This GEDAI function reconstructs the signal after removing artifactual components
+%
+%   Evald is r x K (one eigenvalue column per epoch), Evec is N x r x K.
 
 % --- PRE-ALLOCATION ---
-num_chans = size(Eval, 1);
-num_epochs = size(Eval, 3);
-% Pre-allocate the array 
-all_diagonals = zeros(num_chans * num_epochs, 1, 'like', Eval);
-for i = 1:num_epochs
-    start_idx = (i-1) * num_chans + 1;
-    end_idx = i * num_chans;
-    all_diagonals(start_idx:end_idx) = diag(Eval(:,:,i));
-end
-% Use the magnitude (a real value) for all subsequent calculations.
-magnitudes = abs(all_diagonals);
-log_Eig_val_all = log(magnitudes(magnitudes > 0)) + 100;
-
+num_chans  = size(Evec, 1);
+num_epochs = size(Evec, 3);
+magnitudes = abs(Evald);
 
 %% Artifacting multiplication factor T1
 correction_factor = 1.00;
@@ -47,25 +39,14 @@ if nargin < 11 || isempty(percentile_threshold)
     end
 end
 
-% Compute Treshold1 per epoch to match exactly how clean_SENSAI evaluates it:
-% SENSAI uses the GLOBAL percentile of ALL eigenvalues in the window it was
-% optimized on. We replicate that here by computing one percentile over ALL
-% eigenvalues (all channels × all epochs) and scaling per-epoch by T1_array.
-global_log_prctile = prctile(log_Eig_val_all, percentile_threshold);
-Treshold1_array = T1_array * global_log_prctile;
+% One percentile over ALL eigenvalues (all channels x all epochs), scaled
+% per epoch by T1_array, so that this matches exactly how SENSAI evaluated
+% the threshold it optimized.
+threshold_array = gedai_eig_threshold(Evald, num_chans, percentile_threshold, T1_array);
 
-% %%% Figure?
-% figure('color', 'w')
-% histogram(log_Eig_val_all)
-% xline(prctile(log_Eig_val_all, 96), '-', '95%')
-% xline(prctile(log_Eig_val_all, 98), '-', '98%')
-% xline(prctile(log_Eig_val_all, 99), '-', '99%')
-% xlabel('Eigenvalues (all chans x all epochs)')
-% ylabel('#')
-
-%% Compute refCOV_reg for B-orthogonal reconstruction (Change A)
+%% Compute refCOV_reg for B-orthogonal reconstruction
 % V^{-T} = refCOV_reg * V  (from GEVD B-orthogonality: V'*B*V = I)
-% This replaces the per-epoch O(n^3) backslash with two O(n^2*T) matrix multiplies.
+% This replaces the per-epoch O(n^3) backslash with matrix multiplies.
 if nargin < 10 || isempty(refCOV_reg_in)
     refCOV_local = real(refCOV);
     refCOV_local = (refCOV_local + refCOV_local') / 2;
@@ -77,7 +58,7 @@ else
     refCOV_reg = refCOV_reg_in;
 end
 
-%% Cleaning EEG by removing outlying GEVD components (Change A: mini-batched pagemtimes)
+%% Cleaning EEG by removing outlying GEVD components
 epoch_samples = round(srate * epoch_size);
 artifacts = zeros(size(EEGdata_epoched), 'like', EEGdata_epoched);
 cleaned_epoched_data = zeros(size(EEGdata_epoched), 'like', EEGdata_epoched);
@@ -86,42 +67,45 @@ if nargin < 8 || isempty(cosine_weights)
 end
 half_epoch = epoch_samples/2;
 
-eeg_chunk_size = 500;
-for chunk_start = 1:eeg_chunk_size:num_epochs
-    chunk_end = min(chunk_start + eeg_chunk_size - 1, num_epochs);
+for i = 1:num_epochs
+    X = EEGdata_epoched(:,:,i);
 
-    % Batch project all epochs in chunk: Evec' * data (N x T x K)
-    proj_chunk = pagemtimes(Evec(:,:,chunk_start:chunk_end), 'transpose', ...
-                             EEGdata_epoched(:,:,chunk_start:chunk_end), 'none');
+    % Only the suprathreshold components survive the masking that the
+    % original formulation applied to a full N x N spatial filter, and there
+    % are typically a handful of them. Indexing them directly is the same
+    % arithmetic on a much smaller matrix.
+    bad_indices = magnitudes(:,i) >= threshold_array(i);
+    num_bad = sum(bad_indices);
 
-    for k = 1:(chunk_end - chunk_start + 1)
-        i = chunk_start + k - 1;
-
-        % Keep only artifact-component activations (zero out signal rows)
-        signal_indices = abs(diag(Eval(:,:,i))) < exp(Treshold1_array(i) - 100);
-        proj = proj_chunk(:,:,k);
-        proj(signal_indices, :) = 0;
-
-        % B-orthogonal solve: V^{-T} * proj = refCOV_reg * V * proj
-        Signal_to_remove = refCOV_reg * (Evec(:,:,i) * proj);
-
-        artifacts(:,:,i) = Signal_to_remove;
-        cleaned_epoch = EEGdata_epoched(:,:,i) - Signal_to_remove;
-
-        % Apply cosine windowing to mitigate edge effects from epoching
-        if i == 1
-            cleaned_epoch(:, half_epoch+1:end) = cleaned_epoch(:, half_epoch+1:end) .* cosine_weights(:, half_epoch+1:end);
-            artifacts(:, half_epoch+1:end, i) = artifacts(:, half_epoch+1:end, i) .* cosine_weights(:, half_epoch+1:end);
-        elseif i == num_epochs
-            cleaned_epoch(:, 1:half_epoch) = cleaned_epoch(:, 1:half_epoch) .* cosine_weights(:, 1:half_epoch);
-            artifacts(:, 1:half_epoch, i) = artifacts(:, 1:half_epoch, i) .* cosine_weights(:, 1:half_epoch);
+    if num_bad > 0
+        Evec_bad = Evec(:, bad_indices, i);
+        if num_bad <= epoch_samples
+            % Fold refCOV_reg into the (N x num_bad) basis first.
+            Signal_to_remove = (refCOV_reg * Evec_bad) * (Evec_bad' * X);
         else
-            cleaned_epoch = cleaned_epoch .* cosine_weights;
-            artifacts(:,:,i) = artifacts(:,:,i) .* cosine_weights;
+            % Cheaper to defer refCOV_reg to the (N x epoch_samples) result.
+            Signal_to_remove = refCOV_reg * (Evec_bad * (Evec_bad' * X));
         end
-
-        cleaned_epoched_data(:,:,i) = cleaned_epoch;
+    else
+        Signal_to_remove = zeros(num_chans, size(X, 2), 'like', X);
     end
+
+    artifacts(:,:,i) = Signal_to_remove;
+    cleaned_epoch = X - Signal_to_remove;
+
+    % Apply cosine windowing to mitigate edge effects from epoching
+    if i == 1
+        cleaned_epoch(:, half_epoch+1:end) = cleaned_epoch(:, half_epoch+1:end) .* cosine_weights(:, half_epoch+1:end);
+        artifacts(:, half_epoch+1:end, i) = artifacts(:, half_epoch+1:end, i) .* cosine_weights(:, half_epoch+1:end);
+    elseif i == num_epochs
+        cleaned_epoch(:, 1:half_epoch) = cleaned_epoch(:, 1:half_epoch) .* cosine_weights(:, 1:half_epoch);
+        artifacts(:, 1:half_epoch, i) = artifacts(:, 1:half_epoch, i) .* cosine_weights(:, 1:half_epoch);
+    else
+        cleaned_epoch = cleaned_epoch .* cosine_weights;
+        artifacts(:,:,i) = artifacts(:,:,i) .* cosine_weights;
+    end
+
+    cleaned_epoched_data(:,:,i) = cleaned_epoch;
 end
 
 % Reshape data back to continuous form and return outputs

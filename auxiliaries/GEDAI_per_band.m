@@ -11,7 +11,13 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [cleaned_data, artifacts_data, SENSAI_score, artifact_threshold_out, ENOVA] = GEDAI_per_band(eeg_data, srate, chanlocs, artifact_threshold_type, epoch_size, refCOV, optimization_type, parallel, signal_type, minThreshold, maxThreshold, smoothing_window_seconds, percentile_threshold)
+function [cleaned_data, artifacts_data, SENSAI_score, artifact_threshold_out, ENOVA] = GEDAI_per_band(eeg_data, srate, chanlocs, artifact_threshold_type, epoch_size, refCOV, optimization_type, parallel, signal_type, minThreshold, maxThreshold, smoothing_window_seconds, percentile_threshold, rank_truncation)
+%   rank_truncation - logical, default true. When an epoch is shorter than the
+%                     channel count its covariance is rank deficient, and the
+%                     GEVD is truncated to the supported subspace. This is the
+%                     large memory and speed win on the fast bands. Set false
+%                     to force the full N x N decomposition, which is the
+%                     reference behaviour; see the note at local_gevd.
 
 if isempty(eeg_data)
     error('Cannot process empty data');
@@ -67,56 +73,36 @@ shifting = epoch_samples / 2;
 eeg_data_2 = eeg_data(:, (shifting+1):(end-shifting));
 EEGdata_epoched_2 = reshape(eeg_data_2, N_EEG_electrodes, epoch_samples, []);
 [~,~,N_epochs] = size(EEGdata_epoched);
-%% Calculate Covariance Matrix per Epoch (Change C: mini-batched pagemtimes)
-COV = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
-COV_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
-cov_chunk_size = 500;
-% Stream 1
-for cs = 1:cov_chunk_size:N_epochs
-    ce = min(cs + cov_chunk_size - 1, N_epochs);
-    chunk = EEGdata_epoched(:,:,cs:ce) - mean(EEGdata_epoched(:,:,cs:ce), 2);
-    COV(:,:,cs:ce) = pagemtimes(chunk, 'none', chunk, 'transpose') / (epoch_samples - 1);
-end
-% Stream 2
-N_epochs_2 = N_epochs - 1;
-for cs = 1:cov_chunk_size:N_epochs_2
-    ce = min(cs + cov_chunk_size - 1, N_epochs_2);
-    chunk_2 = EEGdata_epoched_2(:,:,cs:ce) - mean(EEGdata_epoched_2(:,:,cs:ce), 2);
-    COV_2(:,:,cs:ce) = pagemtimes(chunk_2, 'none', chunk_2, 'transpose') / (epoch_samples - 1);
-end
 %% Generalized Eigendecomposition (GEVD)
 regularization_lambda = 0.05;
 reg_val = trace(refCOV) / N_EEG_electrodes;
 refCOV_reg = (1-regularization_lambda)*refCOV + regularization_lambda*reg_val*eye(N_EEG_electrodes, 'like', refCOV);
 refCOV_reg = (refCOV_reg + refCOV_reg') / 2;
-% Change B: Cholesky factored once; each epoch uses triangular solves (O(n^2))
-% instead of a full Cholesky per epoch (O(n^3/3)) inside eig(A,B,'chol').
+% Cholesky factored once; each epoch uses triangular solves (O(n^2)) instead
+% of a full Cholesky per epoch (O(n^3/3)) inside eig(A,B,'chol').
 % GEVD A*v = lambda*B*v with B=R'R -> standard eig of (R^{-T}*A*R^{-1}); back-transform V=R\U.
 R_chol = chol(refCOV_reg); % upper triangular: R_chol'*R_chol = refCOV_reg
-Evec = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
-Eval = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs, 'like', eeg_data);
-Evec_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
-Eval_2 = zeros(N_EEG_electrodes, N_EEG_electrodes, N_epochs-1, 'like', eeg_data);
-for i=1:N_epochs-1
-    A = (COV(:,:,i) + COV(:,:,i)') / 2;
-    A_white = (R_chol' \ A) / R_chol;
-    A_white = (A_white + A_white') / 2;
-    [U, D] = eig(A_white);
-    Evec(:,:,i) = R_chol \ U;
-    Eval(:,:,i) = D;
-    A2 = (COV_2(:,:,i) + COV_2(:,:,i)') / 2;
-    A2_white = (R_chol' \ A2) / R_chol;
-    A2_white = (A2_white + A2_white') / 2;
-    [U2, D2] = eig(A2_white);
-    Evec_2(:,:,i) = R_chol \ U2;
-    Eval_2(:,:,i) = D2;
+
+% The rank of an epoch covariance is capped by the number of samples it is
+% estimated from. For the fast bands (short epochs, and many of them) that
+% cap sits far below the channel count, so the GEVD is truncated to the
+% supported subspace: the same eigenpairs, but a fraction of the storage and
+% of the work. The discarded directions are null space, carry eigenvalue
+% zero, and therefore never contribute to a reconstruction.
+if nargin < 14 || isempty(rank_truncation)
+    rank_truncation = true;
 end
-A = (COV(:,:,N_epochs) + COV(:,:,N_epochs)') / 2;
-A_white = (R_chol' \ A) / R_chol;
-A_white = (A_white + A_white') / 2;
-[U, D] = eig(A_white);
-Evec(:,:,N_epochs) = R_chol \ U;
-Eval(:,:,N_epochs) = D;
+if rank_truncation
+    gevd_rank = min(N_EEG_electrodes, epoch_samples - 1);
+else
+    gevd_rank = N_EEG_electrodes;
+end
+
+% Per-epoch covariances are consumed as they are formed rather than stored:
+% nothing downstream reads them, and at N_epochs x N x N they were the
+% largest allocation in this function.
+[Evec,   Evald]   = local_gevd(EEGdata_epoched,   R_chol, gevd_rank, N_EEG_electrodes, epoch_samples);
+[Evec_2, Evald_2] = local_gevd(EEGdata_epoched_2, R_chol, gevd_rank, N_EEG_electrodes, epoch_samples);
 
 
 %% Determine Artifact Threshold and Clean EEG
@@ -221,14 +207,13 @@ for w = 1:num_windows
     
     window_centers(w) = (idx_start + idx_end) / 2;
     
-    Eval_sub = Eval(:,:,idx_start:idx_end);
+    Evald_sub = Evald(:,idx_start:idx_end);
     Evec_sub = Evec(:,:,idx_start:idx_end);
-    COV_sub = COV(:,:,idx_start:idx_end);
-    
+
     switch optimization_type
         case 'parabolic'
             tFminbnd = tic;
-            [optimal_artifact_threshold] = SENSAI_fminbnd(minThreshold, maxThreshold, refCOV, Eval_sub, Evec_sub, noise_multiplier, COV_sub, evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold);
+            [optimal_artifact_threshold] = SENSAI_fminbnd(minThreshold, maxThreshold, refCOV, Evald_sub, Evec_sub, noise_multiplier, evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold);
             fprintf('  SENSAI_fminbnd (window %d/%d): %.2f s\n', w, num_windows, toc(tFminbnd));
         
         case 'grid' % Restored grid search functionality
@@ -242,13 +227,13 @@ for w = 1:num_windows
                 parfor threshold_index=1:length(AutomaticThresholdSweep)
                     artifact_threshold_iter = AutomaticThresholdSweep(threshold_index);
                     % Call SENSAI function
-                    [SIGNAL_subspace_similarity(threshold_index), NOISE_subspace_similarity(threshold_index), SENSAI_score(threshold_index)] = SENSAI(artifact_threshold_iter, refCOV, Eval_sub, Evec_sub, noise_multiplier, COV_sub, evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold);
+                    [SIGNAL_subspace_similarity(threshold_index), NOISE_subspace_similarity(threshold_index), SENSAI_score(threshold_index)] = SENSAI(artifact_threshold_iter, refCOV, Evald_sub, Evec_sub, noise_multiplier, evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold);
                 end
             else
                 for threshold_index=1:length(AutomaticThresholdSweep)
                     artifact_threshold_iter = AutomaticThresholdSweep(threshold_index);
                     % Call SENSAI function
-                    [SIGNAL_subspace_similarity(threshold_index), NOISE_subspace_similarity(threshold_index), SENSAI_score(threshold_index)] = SENSAI(artifact_threshold_iter, refCOV, Eval_sub, Evec_sub, noise_multiplier, COV_sub, evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold);
+                    [SIGNAL_subspace_similarity(threshold_index), NOISE_subspace_similarity(threshold_index), SENSAI_score(threshold_index)] = SENSAI(artifact_threshold_iter, refCOV, Evald_sub, Evec_sub, noise_multiplier, evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold);
                 end
             end
             [~, SENSAI_index] = max(SENSAI_score);
@@ -300,14 +285,14 @@ if isempty(artifact_threshold_2)
 end
 
 tClean1 = tic;
-[cleaned_data_1, artifacts_data_1, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold, refCOV, Eval, Evec, cosine_weights, signal_type, refCOV_reg, percentile_threshold);
+[cleaned_data_1, artifacts_data_1, artifact_threshold_out] = clean_EEG(EEGdata_epoched, srate, epoch_size, artifact_threshold, refCOV, Evald, Evec, cosine_weights, signal_type, refCOV_reg, percentile_threshold);
 fprintf('  clean_EEG (stream 1): %.2f s\n', toc(tClean1));
 tClean2 = tic;
-[cleaned_data_2, artifacts_data_2, ~] = clean_EEG(EEGdata_epoched_2, srate, epoch_size, artifact_threshold_2, refCOV, Eval_2, Evec_2, cosine_weights, signal_type, refCOV_reg, percentile_threshold);
+[cleaned_data_2, artifacts_data_2, ~] = clean_EEG(EEGdata_epoched_2, srate, epoch_size, artifact_threshold_2, refCOV, Evald_2, Evec_2, cosine_weights, signal_type, refCOV_reg, percentile_threshold);
 fprintf('  clean_EEG (stream 2): %.2f s\n', toc(tClean2));
 
 % Clear Stream 2 inputs as they are no longer needed
-clear EEGdata_epoched_2 Evec_2 Eval_2 COV_2;
+clear EEGdata_epoched_2 Evec_2 Evald_2;
 
 %% Combine the two processed streams using cosine weighting
 % cosine_weights is already calculated
@@ -338,7 +323,7 @@ cleaned_data = cleaned_data(:, 1:pnts_original);
 artifacts_data = artifacts_data(:, 1:pnts_original);
 
 %% Calculate final SENSAI score
-[~, ~, SENSAI_score] = SENSAI(mean(artifact_threshold_out), refCOV, Eval, Evec, noise_multiplier, COV, evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold);
+[~, ~, SENSAI_score] = SENSAI(mean(artifact_threshold_out), refCOV, Evald, Evec, noise_multiplier, evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold);
 
 % Calculate mean ENOVA for this band (average of per-epoch variance ratios)
 original_data = cleaned_data + artifacts_data;
@@ -371,5 +356,63 @@ if num_epochs > 0
     ENOVA = mean(enova_per_epoch);
 else
     ENOVA = 0;
+end
+end
+
+
+function [Evec, Evald] = local_gevd(X_epoched, R_chol, r, N, T)
+%LOCAL_GEVD  Per-epoch generalized eigendecomposition against refCOV_reg.
+%
+%   Returns Evec (N x r x K) and Evald (r x K). The covariance of each epoch
+%   is formed and consumed inside the loop instead of being stored, and only
+%   the eigenvalue diagonal is kept rather than a full N x N matrix per epoch.
+%
+%   When r < N the epoch covariance is rank deficient. Rather than form the
+%   N x N covariance and discard most of the result, the whitened epoch is
+%   decomposed directly: with Z = R^{-T}*X, the whitened covariance is
+%   Z*Z'/(T-1), whose eigenvectors are the left singular vectors of Z. That
+%   costs O(N*T^2) instead of O(N^3) and yields exactly r components.
+
+K = size(X_epoched, 3);
+Evec  = zeros(N, r, K, 'like', X_epoched);
+Evald = zeros(r, K, 'like', X_epoched);
+if K == 0
+    return
+end
+
+truncated = (r < N);
+
+% Chunked so the centred copy and the batched covariance stay bounded,
+% independent of how many epochs the band has.
+chunk_size = max(1, min(500, floor(2^23 / max(N * T, 1))));
+
+for cs = 1:chunk_size:K
+    ce = min(cs + chunk_size - 1, K);
+    blk = X_epoched(:,:,cs:ce);
+    blk = blk - mean(blk, 2);
+
+    if truncated
+        % One triangular solve for the whole block, then an economy SVD per
+        % epoch. No covariance is ever formed.
+        Z = R_chol' \ reshape(blk, N, []);
+        Z = reshape(Z, N, T, []);
+        for k = 1:(ce - cs + 1)
+            [U, S, ~] = svd(Z(:,:,k), 'econ');
+            s = diag(S);
+            Evec(:,:,cs+k-1) = R_chol \ U(:,1:r);
+            Evald(:,cs+k-1)  = s(1:r).^2 / (T - 1);
+        end
+    else
+        C = pagemtimes(blk, 'none', blk, 'transpose') / (T - 1);
+        for k = 1:(ce - cs + 1)
+            A = C(:,:,k);
+            A = (A + A') / 2;
+            A_white = (R_chol' \ A) / R_chol;
+            A_white = (A_white + A_white') / 2;
+            [U, D] = eig(A_white);
+            Evec(:,:,cs+k-1) = R_chol \ U;
+            Evald(:,cs+k-1)  = diag(D);
+        end
+    end
 end
 end
