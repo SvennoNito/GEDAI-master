@@ -864,7 +864,7 @@ if ~parallel || ~success_parallel
             end
             
             try
-             disp(['processing wavelet band = ' num2str(f)])   
+             disp(sprintf('processing wavelet band = %d/%d (%.2g - %.2g Hz)', f, num_bands_to_process, lower_frequencies(f), upper_frequencies(f)))
              [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(double(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, [], smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
             
             catch ME
@@ -902,7 +902,7 @@ if ~parallel || ~success_parallel
             end
             
             [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(single(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, [], smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
-            disp(['processing wavelet band (single) = ' num2str(f)])
+            disp(sprintf('processing wavelet band (single) = %d/%d (%.2g - %.2g Hz)', f, num_bands_to_process, lower_frequencies(f), upper_frequencies(f)))
             
             % MEMORY OPTIMIZED: Accumulate directly into 2D array
             wavelet_band_filtered_data = wavelet_band_filtered_data + cleaned_band_data;
