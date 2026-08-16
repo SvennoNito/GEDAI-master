@@ -109,7 +109,7 @@ else
     else
         sensai_idx  = 1:K;
     end
-    [Evec_s, Evald_s] = local_gevd_subset(eeg_data, sensai_idx, 0, Te, R_chol, r, truncated, N);
+    [Evec_s, Evald_s] = local_gevd_subset(eeg_data, sensai_idx, 0, Te, R_chol, r, truncated, N, opts.parallel_blocks);
 
     switch optimization_type
         case 'parabolic'
@@ -220,34 +220,82 @@ sig_dist = zeros(1, K);
 noi_dist = zeros(1, K);
 nbad = struct('sum', 0, 'max', 0, 'n', K);
 
-for b = 1:nblocks
-    cs = (b-1)*block + 1;
-    ce = min(K, b*block);
-    if isempty(Utop), Ub = []; Db = []; else, Ub = Utop(:,:,cs:ce); Db = Dtop(:,cs:ce); end
-    [seg, s_b, n_b, nb_sum, nb_max] = local_clean_block( ...
-        X, off, cs, ce, K, Te, R_chol, B, r, truncated, N, cut, cosine_weights, ...
-        do_sensai, Template_guess, T_proj, M_ssi, Ub, Db);
-    cleaned(:, (cs-1)*Te+1 : ce*Te) = seg;
-    if do_sensai
-        sig_dist(cs:ce) = s_b;
-        noi_dist(cs:ce) = n_b;
+if opts.parallel_blocks && nblocks > 1
+    % Blocks are independent once the threshold is fixed, so they go to a pool.
+    % They are dispatched in waves rather than all at once: a parfor cannot
+    % slice X (the block offset is not the loop variable), so each wave's
+    % blocks are cut out first and only those slices cross to the workers.
+    % That keeps the extra allocation at wave_size x block instead of a full
+    % broadcast copy of the band per worker.
+    p = gcp('nocreate');
+    if isempty(p), nw = 0; else, nw = p.NumWorkers; end
+    wave = max(1, 2 * max(nw, 1));
+
+    for w0 = 1:wave:nblocks
+        w1 = min(nblocks, w0 + wave - 1);
+        m  = w1 - w0 + 1;
+        Xb = cell(1, m); Ub = cell(1, m); Db = cell(1, m);
+        css = zeros(1, m); ces = zeros(1, m);
+        for j = 1:m
+            b = w0 + j - 1;
+            css(j) = (b-1)*block + 1;
+            ces(j) = min(K, b*block);
+            s0 = off + (css(j)-1)*Te;
+            Xb{j} = X(:, s0+1 : s0 + (ces(j)-css(j)+1)*Te);
+            if ~isempty(Utop)
+                Ub{j} = Utop(:,:,css(j):ces(j));
+                Db{j} = Dtop(:,css(j):ces(j));
+            end
+        end
+        segs = cell(1, m); sgs = cell(1, m); ngs = cell(1, m);
+        nbs = zeros(1, m); nbm = zeros(1, m);
+        parfor j = 1:m
+            [segs{j}, sgs{j}, ngs{j}, nbs(j), nbm(j)] = local_clean_block( ...
+                Xb{j}, css(j), ces(j), K, Te, R_chol, B, r, truncated, N, cut, ...
+                cosine_weights, do_sensai, Template_guess, T_proj, M_ssi, Ub{j}, Db{j});
+        end
+        for j = 1:m
+            cleaned(:, (css(j)-1)*Te+1 : ces(j)*Te) = segs{j};
+            if do_sensai
+                sig_dist(css(j):ces(j)) = sgs{j};
+                noi_dist(css(j):ces(j)) = ngs{j};
+            end
+            nbad.sum = nbad.sum + nbs(j);
+            nbad.max = max(nbad.max, nbm(j));
+        end
     end
-    nbad.sum = nbad.sum + nb_sum;
-    nbad.max = max(nbad.max, nb_max);
+else
+    for b = 1:nblocks
+        cs = (b-1)*block + 1;
+        ce = min(K, b*block);
+        if isempty(Utop), Ub = []; Db = []; else, Ub = Utop(:,:,cs:ce); Db = Dtop(:,cs:ce); end
+        s0 = off + (cs-1)*Te;
+        Xblk = X(:, s0+1 : s0 + (ce-cs+1)*Te);
+        [seg, s_b, n_b, nb_sum, nb_max] = local_clean_block( ...
+            Xblk, cs, ce, K, Te, R_chol, B, r, truncated, N, cut, cosine_weights, ...
+            do_sensai, Template_guess, T_proj, M_ssi, Ub, Db);
+        cleaned(:, (cs-1)*Te+1 : ce*Te) = seg;
+        if do_sensai
+            sig_dist(cs:ce) = s_b;
+            noi_dist(cs:ce) = n_b;
+        end
+        nbad.sum = nbad.sum + nb_sum;
+        nbad.max = max(nbad.max, nb_max);
+    end
 end
 end
 
 % =====================================================================
 function [seg, sig_b, noi_b, nb_sum, nb_max] = local_clean_block( ...
-    X, off, cs, ce, K, Te, R_chol, B, r, truncated, N, cut, cosine_weights, ...
+    Xblk, cs, ce, K, Te, R_chol, B, r, truncated, N, cut, cosine_weights, ...
     do_sensai, Template_guess, T_proj, M_ssi, Utop, Dtop)
-%LOCAL_CLEAN_BLOCK  One block of epochs. Depends on nothing outside itself
-%   except the (already fixed) threshold, which is what makes the block loop
-%   safe to parallelise.
+%LOCAL_CLEAN_BLOCK  One block of epochs, given that block's samples.
+%   Depends on nothing outside itself except the (already fixed) threshold and
+%   the two global epoch indices used by the cosine edge rule, which is what
+%   makes the block loop safe to run on a pool.
 
 c  = ce - cs + 1;
-s0 = off + (cs-1)*Te;
-D3 = reshape(X(:, s0+1 : s0+c*Te), N, Te, c);
+D3 = reshape(Xblk, N, Te, c);
 Dc = D3 - mean(D3, 2);
 have_cache = ~isempty(Utop);
 if have_cache
@@ -259,7 +307,7 @@ else
     end
 end
 
-seg    = zeros(N, c*Te, 'like', X);
+seg    = zeros(N, c*Te, 'like', Xblk);
 sig_b  = zeros(1, c);
 noi_b  = zeros(1, c);
 nb_sum = 0; nb_max = 0;
@@ -321,7 +369,7 @@ for k = 1:c
             Xk = Xk - B * (V_bad * (V_bad' * Xk));
         end
     else
-        V_bad = zeros(N, 0, 'like', X); d_bad = zeros(0, 1, 'like', X);
+        V_bad = zeros(N, 0, 'like', Xblk); d_bad = zeros(0, 1, 'like', Xblk);
     end
 
     if do_sensai
@@ -395,16 +443,51 @@ Y = (Xc * (Xc' * S)) / (Te - 1);
 end
 
 % =====================================================================
-function [Evec, Evald] = local_gevd_subset(X, idx, off, Te, R_chol, r, truncated, N)
+function [Evec, Evald] = local_gevd_subset(X, idx, off, Te, R_chol, r, truncated, N, parallel_blocks)
 %LOCAL_GEVD_SUBSET  Full decomposition, for the SENSAI epochs only. The
 %   optimiser sweeps thresholds, so the good/bad split moves and it genuinely
-%   needs the whole eigenbasis on these few hundred epochs.
+%   needs the whole eigenbasis on these few hundred epochs. Several seconds a
+%   band, so it goes to the pool as well when one is in use.
+if nargin < 9, parallel_blocks = false; end
 n = numel(idx);
-Evec  = zeros(N, r, n, 'like', X);
-Evald = zeros(r, n, 'like', X);
+Xs = zeros(N, Te, n, 'like', X);
 for j = 1:n
     s0 = off + (idx(j)-1)*Te;
-    Xk = X(:, s0+1 : s0+Te);
+    Xs(:,:,j) = X(:, s0+1 : s0+Te);
+end
+
+if parallel_blocks && n > 8
+    p = gcp('nocreate');
+    if isempty(p), nw = 1; else, nw = p.NumWorkers; end
+    part = max(1, ceil(n / max(nw, 1)));
+    starts = 1:part:n;
+    m = numel(starts);
+    Xc = cell(1, m); lo = zeros(1, m); hi = zeros(1, m);
+    for j = 1:m
+        lo(j) = starts(j); hi(j) = min(n, starts(j)+part-1);
+        Xc{j} = Xs(:,:,lo(j):hi(j));
+    end
+    Ec = cell(1, m); Dc = cell(1, m);
+    parfor j = 1:m
+        [Ec{j}, Dc{j}] = local_gevd_subset_core(Xc{j}, Te, R_chol, r, truncated, N);
+    end
+    Evec  = zeros(N, r, n, 'like', X);
+    Evald = zeros(r, n, 'like', X);
+    for j = 1:m
+        Evec(:,:,lo(j):hi(j)) = Ec{j};
+        Evald(:,lo(j):hi(j))  = Dc{j};
+    end
+else
+    [Evec, Evald] = local_gevd_subset_core(Xs, Te, R_chol, r, truncated, N);
+end
+end
+
+function [Evec, Evald] = local_gevd_subset_core(Xs, Te, R_chol, r, truncated, N)
+n = size(Xs, 3);
+Evec  = zeros(N, r, n, 'like', Xs);
+Evald = zeros(r, n, 'like', Xs);
+for j = 1:n
+    Xk = Xs(:,:,j);
     Xk = Xk - mean(Xk, 2);
     Z  = R_chol' \ Xk;
     if truncated
@@ -439,32 +522,84 @@ if isempty(block)
     bytes = 8; if isa(X, 'single'), bytes = 4; end
     block = max(1, min(512, floor(256*2^20 / max(4 * N * Te * bytes, 1))));
 end
-for cs = 1:block:K
-    ce = min(cs + block - 1, K);
-    c  = ce - cs + 1;
-    s0 = off + (cs-1)*Te;
-    D3 = reshape(X(:, s0+1 : s0+c*Te), N, Te, c);
-    Dc = D3 - mean(D3, 2);
-    Z  = reshape(R_chol' \ reshape(Dc, N, []), N, Te, c);
-    if truncated
-        for k = 1:c
-            Zk = Z(:,:,k); G = Zk' * Zk; G = (G + G') / 2;
-            dg = sort(eig(G), 'descend');
-            Evald(:, cs+k-1) = dg(1:r) / (Te - 1);
+starts  = 1:block:K;
+nblocks = numel(starts);
+
+if opts.parallel_blocks && nblocks > 1
+    p = gcp('nocreate');
+    if isempty(p), nw = 0; else, nw = p.NumWorkers; end
+    wave = max(1, 2 * max(nw, 1));
+    for w0 = 1:wave:nblocks
+        w1 = min(nblocks, w0 + wave - 1);
+        m  = w1 - w0 + 1;
+        Xb = cell(1, m); css = zeros(1, m); ces = zeros(1, m);
+        for j = 1:m
+            css(j) = starts(w0 + j - 1);
+            ces(j) = min(css(j) + block - 1, K);
+            s0 = off + (css(j)-1)*Te;
+            Xb{j} = X(:, s0+1 : s0 + (ces(j)-css(j)+1)*Te);
         end
-    else
-        A = pagemtimes(Z, 'none', Z, 'transpose') / (Te - 1);
-        for k = 1:c
-            Ak = A(:,:,k); Ak = (Ak + Ak') / 2;
+        Eb = cell(1, m); Uc = cell(1, m); Dc_ = cell(1, m);
+        parfor j = 1:m
+            [Eb{j}, Uc{j}, Dc_{j}] = local_prepass_block(Xb{j}, Te, R_chol, r, ...
+                truncated, N, keep_vectors, k_keep);
+        end
+        for j = 1:m
+            Evald(:, css(j):ces(j)) = Eb{j};
             if keep_vectors
-                [Wa, Da] = eig(Ak);
-                d = diag(Da); [d, ix] = sort(d, 'descend');
-                Evald(:, cs+k-1)  = d;
-                Utop(:, :, cs+k-1) = Wa(:, ix(1:k_keep));
-                Dtop(:, cs+k-1)    = d(1:k_keep);
-            else
-                Evald(:, cs+k-1) = sort(eig(Ak), 'descend');
+                Utop(:, :, css(j):ces(j)) = Uc{j};
+                Dtop(:, css(j):ces(j))    = Dc_{j};
             end
+        end
+    end
+else
+    for b = 1:nblocks
+        cs = starts(b);
+        ce = min(cs + block - 1, K);
+        s0 = off + (cs-1)*Te;
+        Xblk = X(:, s0+1 : s0 + (ce-cs+1)*Te);
+        [Eb, Uc, Dc_] = local_prepass_block(Xblk, Te, R_chol, r, truncated, N, keep_vectors, k_keep);
+        Evald(:, cs:ce) = Eb;
+        if keep_vectors
+            Utop(:, :, cs:ce) = Uc;
+            Dtop(:, cs:ce)    = Dc_;
+        end
+    end
+end
+end
+
+% =====================================================================
+function [Evald, Utop, Dtop] = local_prepass_block(Xblk, Te, R_chol, r, truncated, N, keep_vectors, k_keep)
+%LOCAL_PREPASS_BLOCK  Spectrum (and optionally leading vectors) for one block.
+c  = size(Xblk, 2) / Te;
+D3 = reshape(Xblk, N, Te, c);
+Dc = D3 - mean(D3, 2);
+Z  = reshape(R_chol' \ reshape(Dc, N, []), N, Te, c);
+Evald = zeros(r, c, 'like', Xblk);
+if keep_vectors
+    Utop = zeros(N, k_keep, c, 'like', Xblk);
+    Dtop = zeros(k_keep, c, 'like', Xblk);
+else
+    Utop = []; Dtop = [];
+end
+if truncated
+    for k = 1:c
+        Zk = Z(:,:,k); G = Zk' * Zk; G = (G + G') / 2;
+        dg = sort(eig(G), 'descend');
+        Evald(:, k) = dg(1:r) / (Te - 1);
+    end
+else
+    A = pagemtimes(Z, 'none', Z, 'transpose') / (Te - 1);
+    for k = 1:c
+        Ak = A(:,:,k); Ak = (Ak + Ak') / 2;
+        if keep_vectors
+            [Wa, Da] = eig(Ak);
+            d = diag(Da); [d, ix] = sort(d, 'descend');
+            Evald(:, k)  = d;
+            Utop(:, :, k) = Wa(:, ix(1:k_keep));
+            Dtop(:, k)    = d(1:k_keep);
+        else
+            Evald(:, k) = sort(eig(Ak), 'descend');
         end
     end
 end

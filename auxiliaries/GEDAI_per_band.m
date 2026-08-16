@@ -60,8 +60,16 @@ if ~isfield(opts, 'want_artifacts'), opts.want_artifacts = true;  end
 if ~isfield(opts, 'force_legacy'),   opts.force_legacy   = false; end
 if ~isfield(opts, 'artifact_threshold_override'), opts.artifact_threshold_override = []; end
 
+% The streaming path pays for itself only when there are many epochs. Its
+% threshold stage decomposes up to 500 epochs for SENSAI and then sweeps the
+% spectrum of every epoch; when the band has fewer than ~500 epochs those are
+% the same epochs twice over, and the legacy path - one decomposition, kept -
+% is simply the better algorithm. Long-epoch bands are exactly that case, and
+% their stored eigenbasis is small because K = T/Te is small.
+epochs_in_band = floor(size(eeg_data, 2) / round(srate * epoch_size));
 use_stream = isinf(smoothing_window_seconds) && ~opts.force_legacy && ...
-             (ischar(optimization_type) && strcmp(optimization_type, 'parabolic'));
+             (ischar(optimization_type) && strcmp(optimization_type, 'parabolic')) && ...
+             epochs_in_band > 500;
 
 if ~use_stream
     [cleaned_data, artifacts_data, SENSAI_score, artifact_threshold_out, ENOVA] = ...

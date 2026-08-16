@@ -191,6 +191,22 @@ if ~ismember(lower(signal_type), {'eeg', 'meg'})
 end
 signal_type = lower(signal_type);
 
+%% Parallelisation axis.
+%%   parallel = true      parfor over frequency bands (the original behaviour).
+%%                        At most nBands tasks, badly unbalanced (the widest
+%%                        band costs ~7x the narrowest), and every worker gets
+%%                        a broadcast copy of the full-length band data.
+%%   parallel = 'blocks'  serial band loop, parfor over time blocks inside each
+%%                        band. Once the threshold is fixed the epochs are
+%%                        independent, so a band splits into many equal tasks
+%%                        and per-worker memory is one block rather than one
+%%                        band. Nested parfor does not nest, so the band loop
+%%                        has to give way.
+use_block_parallel = (ischar(parallel) || isstring(parallel)) && strcmpi(char(parallel), 'blocks');
+if use_block_parallel
+    parallel = false;
+end
+
 p = fileparts(which('GEDAI'));
 addpath(fullfile(p, 'auxiliaries'));
 tStart = tic;
@@ -648,7 +664,7 @@ end
     %% GEDAI.m never uses GEDAI_per_band's artifacts output (every call site
     %% discards it with ~), and it is a full extra copy of the band. EEGartifacts
     %% is reconstructed later as EEGavRef.data - EEGclean.data.
-    gedai_band_opts = struct('want_artifacts', false);
+    gedai_band_opts = struct('want_artifacts', false, 'parallel_blocks', use_block_parallel);
 
     disp([newline 'SENSAI threshold detection...please wait']);
     broadband_optimization_type = 'parabolic';
