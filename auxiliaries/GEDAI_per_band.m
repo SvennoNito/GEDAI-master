@@ -126,15 +126,22 @@ clear cleaned_padded
 % ENOVA per epoch, accumulated without ever building the artifact array.
 % cleaned + artifacts == input by construction, so the removed signal is just
 % the difference and never needs to be stored in full.
+% Vectorised over epochs, in chunks. Two var() calls per epoch showed up as
+% 364k calls / ~600 s in a whole-pipeline profile; one call per chunk instead.
+% Chunked rather than whole-array so the difference never costs a full copy.
 num_epochs_possible = floor(pnts_original / epoch_samples);
 if num_epochs_possible > 0
     enova_per_epoch = zeros(1, num_epochs_possible);
-    for i = 1:num_epochs_possible
-        sl = (i-1)*epoch_samples + 1 : i*epoch_samples;
-        o  = eeg_data(:, sl);
-        a  = o - cleaned_data(:, sl);
-        vo = var(o(:));
-        if vo > 0, enova_per_epoch(i) = var(a(:)) / vo; end
+    ep_per_chunk = max(1, floor(64*2^20 / max(N_EEG_electrodes * epoch_samples * 8, 1)));
+    for cs = 1:ep_per_chunk:num_epochs_possible
+        ce = min(cs + ep_per_chunk - 1, num_epochs_possible);
+        sl = (cs-1)*epoch_samples + 1 : ce*epoch_samples;
+        nc = ce - cs + 1;
+        O  = reshape(eeg_data(:, sl), [], nc);
+        A  = O - reshape(cleaned_data(:, sl), [], nc);
+        vo = var(O, 0, 1); va = var(A, 0, 1);
+        e  = zeros(1, nc); m = vo > 0; e(m) = va(m) ./ vo(m);
+        enova_per_epoch(cs:ce) = e;
     end
     ENOVA = mean(enova_per_epoch);
 else
@@ -231,9 +238,10 @@ if refCOV_top_PCs < SSI_top_PCs
     warning('GEDAI:LowRefCOVPCs', 'refCOV variance appears to be concentrated in too few principal components. Verify that leadfield matrix is well constructed.');
 end
 
-[evecs_Template_cov, evals_Template_cov] = eigs(refCOV_reg, refCOV_top_PCs);
+% eigs only accepts double; refCOV_reg follows the band's working precision.
+[evecs_Template_cov, evals_Template_cov] = eigs(double(refCOV_reg), refCOV_top_PCs);
 [~, sidxS_Template_cov] = sort(diag(evals_Template_cov), 'descend');
-evecs_Template_cov = evecs_Template_cov(:, sidxS_Template_cov);
+evecs_Template_cov = cast(evecs_Template_cov(:, sidxS_Template_cov), 'like', refCOV_reg);
 
 if isinf(smoothing_window_seconds)
     window_seconds = N_epochs * epoch_size;
@@ -368,16 +376,14 @@ original_epoched = reshape(original_data(:, 1:len_to_use), size(original_data, 1
 artifacts_epoched = reshape(artifacts_data(:, 1:len_to_use), size(artifacts_data, 1), epoch_samples, []);
 
 num_epochs = size(original_epoched, 3);
+% one var() per array instead of two per epoch (see the streaming path)
+original_flat  = reshape(original_epoched,  [], num_epochs);
+artifacts_flat = reshape(artifacts_epoched, [], num_epochs);
+var_orig = var(original_flat, 0, 1);
+var_art  = var(artifacts_flat, 0, 1);
 enova_per_epoch = zeros(1, num_epochs);
-for i = 1:num_epochs
-    var_orig = var(reshape(original_epoched(:,:,i), [], 1));
-    var_art = var(reshape(artifacts_epoched(:,:,i), [], 1));
-    if var_orig > 0
-        enova_per_epoch(i) = var_art / var_orig;
-    else
-        enova_per_epoch(i) = 0;
-    end
-end
+valid = var_orig > 0;
+enova_per_epoch(valid) = var_art(valid) ./ var_orig(valid);
 
 if num_epochs > 0
     ENOVA = mean(enova_per_epoch);

@@ -78,9 +78,12 @@ else
     refCOV_top_PCs = max(1, min(find(cumvar >= 0.85, 1, 'first'), N - 1));
     SSI_top_PCs = 4;
 end
-[evecs_Template_cov, evals_Template_cov] = eigs(refCOV_reg, refCOV_top_PCs);
+% eigs only accepts double, and refCOV_reg follows the band's working
+% precision. The template is a property of the head model, not of the data, so
+% it is computed in double regardless and cast afterwards.
+[evecs_Template_cov, evals_Template_cov] = eigs(double(refCOV_reg), refCOV_top_PCs);
 [~, sidx] = sort(diag(evals_Template_cov), 'descend');
-evecs_Template_cov = evecs_Template_cov(:, sidx);
+evecs_Template_cov = cast(evecs_Template_cov(:, sidx), 'like', refCOV_reg);
 
 if isempty(percentile_threshold)
     if strcmpi(signal_type, 'eeg'), pct = 98; else, pct = 99; end
