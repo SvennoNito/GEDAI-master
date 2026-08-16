@@ -59,6 +59,29 @@ if nargin < 15 || isempty(opts), opts = struct; end
 if ~isfield(opts, 'want_artifacts'), opts.want_artifacts = true;  end
 if ~isfield(opts, 'force_legacy'),   opts.force_legacy   = false; end
 if ~isfield(opts, 'artifact_threshold_override'), opts.artifact_threshold_override = []; end
+if ~isfield(opts, 'precision'),      opts.precision      = 'double'; end
+
+% ---- precision policy ---------------------------------------------------
+% 'auto' runs a band in single precision only when its epoch is longer than the
+% channel count. Measured on a real night, 256 ch:
+%   epoch 384 samples : 1.97x faster, cleaned data differs by 1.3e-5 relative
+%   epoch  48 samples : 1.21x faster, cleaned data differs by 3.3e-2 relative
+% The second number is not rounding noise. Short epochs go through the Gram
+% matrix of the whitened epoch, which squares the condition number, and the
+% components that move are the ones sitting near a threshold that SENSAI only
+% weakly determines. So the split is deliberate, not a tuning constant.
+epoch_samples_for_precision = round(srate * epoch_size);
+switch lower(opts.precision)
+    case 'single', use_single = true;
+    case 'auto',   use_single = epoch_samples_for_precision > N_EEG_electrodes;
+    otherwise,     use_single = false;
+end
+cast_back = false;
+if use_single && isa(eeg_data, 'double')
+    eeg_data  = single(eeg_data);
+    refCOV    = single(refCOV);
+    cast_back = true;   % the caller accumulates bands in double
+end
 
 % The streaming path pays for itself only when there are many epochs. Its
 % threshold stage decomposes up to 500 epochs for SENSAI and then sweeps the
@@ -76,6 +99,10 @@ if ~use_stream
         local_legacy_path(eeg_data, srate, chanlocs, artifact_threshold_type, epoch_size, ...
             refCOV, optimization_type, parallel, signal_type, minThreshold, maxThreshold, ...
             smoothing_window_seconds, percentile_threshold, rank_truncation, opts);
+    if cast_back
+        cleaned_data = double(cleaned_data);
+        if ~isempty(artifacts_data), artifacts_data = double(artifacts_data); end
+    end
     return
 end
 
@@ -118,6 +145,11 @@ if opts.want_artifacts
     artifacts_data = eeg_data(:, 1:pnts_original) - cleaned_data;
 else
     artifacts_data = [];
+end
+
+if cast_back
+    cleaned_data = double(cleaned_data);
+    if ~isempty(artifacts_data), artifacts_data = double(artifacts_data); end
 end
 end
 

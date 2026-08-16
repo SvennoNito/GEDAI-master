@@ -664,7 +664,15 @@ end
     %% GEDAI.m never uses GEDAI_per_band's artifacts output (every call site
     %% discards it with ~), and it is a full extra copy of the band. EEGartifacts
     %% is reconstructed later as EEGavRef.data - EEGclean.data.
-    gedai_band_opts = struct('want_artifacts', false, 'parallel_blocks', use_block_parallel);
+    %% precision = 'auto' drops to single only for bands whose epoch is longer
+    %% than the channel count, where it is ~2x faster and changes the cleaned
+    %% data by ~1e-5. Short-epoch bands stay in double: there the same switch
+    %% moved the output by 3.3e-2, because the Gram route squares the condition
+    %% number and the affected components sit near a weakly determined cut.
+    %% Set to 'double' to disable, 'single' to force everywhere.
+    gedai_band_opts = struct('want_artifacts', false, ...
+                             'parallel_blocks', use_block_parallel, ...
+                             'precision', 'auto');
 
     disp([newline 'SENSAI threshold detection...please wait']);
     broadband_optimization_type = 'parabolic';
