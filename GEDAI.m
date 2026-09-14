@@ -438,26 +438,44 @@ if rem(broadband_epoch_size*EEGin.srate, 2) ~= 0
 end
 
 %% Ensure double input (initially)
-EEGin.data=double(EEGin.data);
+% The input stays in the precision it arrived in, and the double-precision,
+% average-referenced, high-passed signal (EEGavRef.data) is built from it by
+% local_prepare_avref. That signal is read by the broadband pass and, at the
+% very end, for the artifact signal and ENOVA; during the wavelet bands it is
+% released and afterwards rebuilt by the same code from the same input. That
+% costs one more average reference and high-pass, and saves a double copy of
+% the recording for the whole wavelet stage, which is where the memory peaks.
+% Work arrays are processed in pieces of about piece_bytes, so that elementwise
+% temporaries never approach the size of the recording.
+piece_bytes = 256 * 2^20;
+EEGavRef = EEGin;
+EEGavRef.data = [];
+apply_avg_ref = false;
 
 %% Pre-processing
 if strcmp(signal_type, 'eeg')
     % Check if data is already average referenced (Standard or via EEGLAB metadata)
-    is_standard_avg_ref = max(abs(sum(EEGin.data, 1) / (size(EEGin.data, 1) + 1))) < 1e-5;
-       
-    if is_standard_avg_ref 
-        disp([newline 'Data is already average referenced. Skipping internal average referencing.']);
-        EEGavRef = EEGin;
+    % (the sums are taken over double data, as before, a block of samples at a time)
+    max_ref_offset = local_max_reference_offset(EEGin.data, piece_bytes);
+    is_standard_avg_ref = max_ref_offset < 1e-5;
 
-    elseif max(abs(sum(EEGin.data, 1) / (size(EEGin.data, 1) + 1))) < 1e-5
+    if is_standard_avg_ref
+        disp([newline 'Data is already average referenced. Skipping internal average referencing.']);
+
+    elseif max_ref_offset < 1e-5
         % Corrected: Removed assignment and evaluated the math directly
         disp([newline 'Data matches non rank-deficient average reference definition. Skipping internal average referencing.']);
-        EEGavRef = EEGin;
-        
+
     else
-        EEGavRef = GEDAI_nonRankDeficientAveRef(EEGin); % non rank-deficient average referencing
-    end 
-    
+        % non rank-deficient average referencing (GEDAI_nonRankDeficientAveRef),
+        % applied to the data in local_prepare_avref
+        apply_avg_ref = true;
+        EEGavRef.ref = 'average';
+        for chIdx = 1:EEGavRef.nbchan
+            EEGavRef.chanlocs(chIdx).ref = 'average';
+        end
+    end
+
 end
 
 
@@ -578,7 +596,7 @@ refCOV = (refCOV + refCOV') / 2;
 highpass_frequency=0.1;
 hp_wavelet_levels = ceil(log2(EEGavRef.srate / highpass_frequency) - 1);
 % Limit to maximum possible level given data length
-max_possible_level = floor(log2(size(EEGavRef.data, 2)));
+max_possible_level = floor(log2(size(EEGin.data, 2)));
 hp_wavelet_levels = min(hp_wavelet_levels, max_possible_level);
 % Ensure reasonable minimum
 hp_wavelet_levels = max(hp_wavelet_levels, 3);
@@ -590,74 +608,11 @@ num_bands_hp = hp_wavelet_levels + 1;
 upper_bounds = srate ./ (2.^(1:num_bands_hp));
 bands_to_zero = find(upper_bounds <= lowcut_frequency);
 
-if ~isempty(bands_to_zero)
-    % Robust execution order: GPU(Double) -> GPU(Single) -> CPU(Double) -> CPU(Single)
-    success = false;
-    warning('off');
-    
-    % Attempt GPU Processing
-    if gpuDeviceCount > 0
-        try
-            disp('Attempting GPU processing (Double Precision)...');
-            parallel.gpu.enableCUDAForwardCompatibility(true)
-            data_gpu = gpuArray(EEGavRef.data');
-            
-            low_freq_noise_gpu = zeros(size(data_gpu), 'like', data_gpu);
-            for b = 1:length(bands_to_zero)
-                band_idx = bands_to_zero(b);
-                low_freq_noise_gpu = low_freq_noise_gpu + modwt_single_band(data_gpu, wavelet_type, hp_wavelet_levels, band_idx);
-            end
-            
-            EEGavRef.data = EEGavRef.data - gather(low_freq_noise_gpu)';
-            clear data_gpu low_freq_noise_gpu;
-            success = true;
-        catch 
-            warning('GPU (Double) failed. Attempting GPU (Single Precision)...');
-            try
-                data_gpu = gpuArray(single(EEGavRef.data'));
-                low_freq_noise_gpu = zeros(size(data_gpu), 'like', data_gpu);
-                for b = 1:length(bands_to_zero)
-                    band_idx = bands_to_zero(b);
-                    low_freq_noise_gpu = low_freq_noise_gpu + modwt_single_band(data_gpu, wavelet_type, hp_wavelet_levels, band_idx);
-                end
-                
-                EEGavRef.data = EEGavRef.data - double(gather(low_freq_noise_gpu)');
-                clear data_gpu low_freq_noise_gpu;
-                success = true;
-            catch 
-                warning('GPU (Single) failed. Falling back to CPU.');
-            end
-        end
-    end
-    
-    % Fallback to CPU if GPU failed or unavailable
-    if ~success
-        try
-            disp('Attempting CPU processing (Double Precision)...');
-            data_cpu = EEGavRef.data';
-            low_freq_noise = zeros(size(data_cpu), 'like', data_cpu);
-            for b = 1:length(bands_to_zero)
-                band_idx = bands_to_zero(b);
-                low_freq_noise = low_freq_noise + modwt_single_band(data_cpu, wavelet_type, hp_wavelet_levels, band_idx);
-            end
-            
-            EEGavRef.data = EEGavRef.data - low_freq_noise';
-            clear data_cpu low_freq_noise;
-        catch 
-            warning('CPU (Double) failed. Attempting CPU (Single Precision)...');
-            % Single precision fallback for OOM
-            data_cpu = single(EEGavRef.data');
-            low_freq_noise = zeros(size(data_cpu), 'like', data_cpu);
-            for b = 1:length(bands_to_zero)
-                band_idx = bands_to_zero(b);
-                low_freq_noise = low_freq_noise + modwt_single_band(data_cpu, wavelet_type, hp_wavelet_levels, band_idx);
-            end
-            
-            EEGavRef.data = EEGavRef.data - double(low_freq_noise');
-            clear data_cpu low_freq_noise;
-        end
-    end
-end
+% Average reference (if needed) and wavelet high-pass, into EEGavRef.data.
+% hp_levels records which precision level of the high-pass cascade each piece
+% ran at, so that the rebuild after the wavelet bands repeats exactly this.
+[EEGavRef.data, hp_levels] = local_prepare_avref(EEGin.data, EEGavRef.nbchan, apply_avg_ref, ...
+    bands_to_zero, wavelet_type, hp_wavelet_levels, piece_bytes, []);
 
     % ------------------ GEDAI ------------------------------
 
@@ -671,13 +626,32 @@ end
     %% number and the affected components sit near a weakly determined cut.
     %% Set to 'double' to disable, 'single' to force everywhere.
     gedai_band_opts = struct('want_artifacts', false, ...
+                             'legacy_artifacts', false, ...
                              'parallel_blocks', use_block_parallel, ...
                              'precision', 'auto');
 
+    %% The band passes run through gedai_band_engine rather than GEDAI_per_band:
+    %% the engine takes its input as a source and hands back the cleaned band a
+    %% stretch at a time, so the cleaned band goes straight into its destination
+    %% instead of being returned whole (GEDAI_per_band is the whole-matrix
+    %% wrapper of the same computation).
     disp([newline 'SENSAI threshold detection...please wait']);
     broadband_optimization_type = 'parabolic';
     broadband_maxThreshold = 12;
-    [cleaned_broadband_data, ~, broadband_sensai, broadband_thresh, broadband_ENOVA] = GEDAI_per_band(double(EEGavRef.data), EEGavRef.srate, EEGavRef.chanlocs, broadband_artifact_threshold_type, broadband_epoch_size, refCOV, broadband_optimization_type, parallel, signal_type, broadband_minThreshold, broadband_maxThreshold, smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
+    broadband_source = gedai_source('matrix', EEGavRef.data);
+    band_state = gedai_band_engine('begin', broadband_source, EEGavRef.srate, EEGavRef.chanlocs, broadband_artifact_threshold_type, broadband_epoch_size, refCOV, broadband_optimization_type, parallel, signal_type, broadband_minThreshold, broadband_maxThreshold, smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
+    clear broadband_source
+    % Samples x channels: it becomes the level-0 wavelet approximation below,
+    % whose per-channel steps want one channel per contiguous column.
+    cleaned_broadband_data = zeros(size(EEGavRef.data, 2), size(EEGavRef.data, 1));
+    while ~band_state.done
+        [band_state, band_segment, first, last] = gedai_band_engine('step', band_state);
+        cleaned_broadband_data(first:last, :) = band_segment.';
+    end
+    [broadband_sensai, broadband_thresh, broadband_ENOVA] = gedai_band_engine('finish', band_state);
+    clear band_state band_segment
+    % Not needed again until the artifact signal at the end, where it is rebuilt.
+    EEGavRef.data = [];
     SENSAI_score_per_band = broadband_sensai;
     artifact_threshold_per_band = mean(broadband_thresh);
     artifact_threshold_array_per_band = {broadband_thresh};
@@ -689,20 +663,19 @@ if broadband_only
     lower_frequencies = [];
     upper_frequencies = [];
     epoch_sizes_per_wavelet_band = [];
-    wavelet_band_filtered_data = cleaned_broadband_data;
+    wavelet_band_filtered_data = cleaned_broadband_data.';
     clear cleaned_broadband_data;
 else
 
 %% Second pass: Wavelet decomposition and per-band denoising
 % MEMORY OPTIMIZED: Use incremental band processing instead of full decomposition
-unfiltered_data = cleaned_broadband_data';
 wavelet_type = 'haar';
 
 % Calculate required number of wavelet levels to isolate lowcut_frequency
 % We need: srate / 2^number_of_wavelet_bands <= lowcut_frequency
 number_of_wavelet_bands = ceil(log2(EEGavRef.srate / lowcut_frequency));
 % Limit to maximum possible level given data length
-max_possible_level = floor(log2(size(EEGavRef.data, 2)));
+max_possible_level = floor(log2(size(EEGin.data, 2)));
 number_of_wavelet_bands = min(number_of_wavelet_bands, max_possible_level);
 % Ensure reasonable minimum
 number_of_wavelet_bands = max(number_of_wavelet_bands, 6);
@@ -711,9 +684,6 @@ number_of_wavelet_bands = max(number_of_wavelet_bands, 6);
 number_of_discrete_wavelet_bands = number_of_wavelet_bands;
 % Actual decomposition level needed to create number_of_discrete_wavelet_bands
 actual_decomposition_level = number_of_discrete_wavelet_bands - 1;  % MODWT creates level+1 bands
-
-% MEMORY OPTIMIZED: Clear source data immediately (no longer needed for full decomposition)
-clear cleaned_broadband_data;
 
 % Pre-calculate center frequencies for each MRA wavelet band
 srate = EEGavRef.srate;
@@ -739,7 +709,7 @@ if num_bands_to_process > 0
     epoch_size_lowest_band = epoch_size_in_cycles / lower_frequencies(lowest_band_to_process_idx);
     required_samples = epoch_size_lowest_band * srate;
 
-    while required_samples > size(EEGavRef.data, 2) && num_bands_to_process > 0
+    while required_samples > size(EEGin.data, 2) && num_bands_to_process > 0
         warning('GEDAI:InsufficientData', 'EEG data length is too short for the epoch size required by the lowest frequency band (%g Hz). Increasing lowcut_frequency.', lower_frequencies(lowest_band_to_process_idx));
         lowcut_frequency = upper_frequencies(lowest_band_to_process_idx);
         lowest_wavelet_bands_to_exclude = sum(upper_frequencies <= lowcut_frequency);
@@ -787,15 +757,26 @@ for f = 1:num_bands_to_process
 end
 
 %% Denoise each wavelet band
-% MEMORY OPTIMIZED: Get dimensions from unfiltered data
-[num_samples, num_channels] = size(unfiltered_data);
-
-% MEMORY OPTIMIZED: Use 2D accumulator with correct type
-% Pre-allocate with same precision as input data
-wavelet_band_filtered_data = zeros(num_channels, num_samples, 'like', unfiltered_data);
+% Band f is multiresolution band f of the Haar MODWT of the broadband-cleaned
+% data. Its synthesis only needs the level f-1 approximation, so that
+% approximation is the one array kept between bands: the band pass
+% reconstructs band f from it (gedai_source 'wavelet', built straight into the
+% band's working precision), and it is advanced to level f in place once band f
+% is done. modwt_single_band recomputed the approximation from scratch for
+% every band, next to a transposed copy of the input; the band values are the
+% same, sample for sample.
+% Like modwt_single_band's input, the approximation is samples x channels.
+wavelet_approximation = cleaned_broadband_data;   % level 0
+clear cleaned_broadband_data
+[num_samples, num_channels] = size(wavelet_approximation);
 success_parallel = false;
 
 if parallel
+    % MEMORY OPTIMIZED: Use 2D accumulator with correct type
+    % Pre-allocate with same precision as input data
+    wavelet_band_filtered_data = zeros(num_channels, num_samples, 'like', wavelet_approximation);
+    % The band-parallel loop gives every worker the whole input, as before.
+    unfiltered_data = wavelet_approximation;
     try
         temp_sensai_scores = zeros(1, num_bands_to_process);
         temp_thresholds = zeros(1, num_bands_to_process);
@@ -837,98 +818,108 @@ if parallel
         artifact_threshold_array_per_band = [artifact_threshold_array_per_band, temp_thresholds_arrays];
         ENOVA_per_band = [ENOVA_per_band, temp_enova_scores];
         success_parallel = true;
-    catch 
+    catch
         warning('Parallel processing failed: %s. Switching to double precision non-parallel processing.');
     end
+    clear unfiltered_data
 end
 
 if ~parallel || ~success_parallel
-    success_serial = false;
     if parallel && ~success_parallel
          disp('Executing fallback: Double Precision Non-Parallel Processing...');
     end
-    
-    try
-        % MEMORY OPTIMIZED: Sequential processing with incremental band extraction
-        for f = 1:num_bands_to_process
-            % Extract single band on-the-fly (no full wpt_EEG storage)
-            wavelet_data_band = modwt_single_band(unfiltered_data, wavelet_type, actual_decomposition_level, f)';
-            
-            current_epoch_size = epoch_sizes_per_wavelet_band(f);
-            
-            % Determine minThreshold based on signal type and frequency
-            current_center_freq = center_frequencies(f);
-            current_minThreshold = 0;
-            if (current_center_freq >= 0.5 && current_center_freq <= 60)
-                current_minThreshold = -6;
-            end
-            
-            try
-             disp(sprintf('processing wavelet band = %d/%d (%.2g - %.2g Hz)', f, num_bands_to_process, lower_frequencies(f), upper_frequencies(f)))
-             [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(double(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, [], smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
-            
-            catch ME
-                warning('GEDAI_per_band failed for band %d: %s. Retrying with single precision...', f, ME.message);
-                [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(single(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, [], smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
-            end
-            
-            % MEMORY OPTIMIZED: Accumulate directly into 2D array
-            wavelet_band_filtered_data = wavelet_band_filtered_data + cleaned_band_data;
-            SENSAI_score_per_band(f+1) = sensai_val;
-            artifact_threshold_per_band(f+1) = mean(thresh_val);
-            artifact_threshold_array_per_band{f+1} = thresh_val;
-            ENOVA_per_band(f+1) = enova_val;
-            
-            % MEMORY OPTIMIZED: Clear band data immediately
-            clear wavelet_data_band cleaned_band_data;
+
+    inv_sqrt2 = 1 / sqrt(2);
+    channels_per_piece = max(1, floor(piece_bytes / (8 * num_samples)));
+    % MEMORY OPTIMIZED: Accumulate the cleaned bands directly (samples x
+    % channels, like the approximation; transposed once at the end)
+    band_sum = zeros(num_samples, num_channels);
+    for f = 1:num_bands_to_process
+        current_epoch_size = epoch_sizes_per_wavelet_band(f);
+
+        % Determine minThreshold based on signal type and frequency
+        current_center_freq = center_frequencies(f);
+        current_minThreshold = 0;
+        if (current_center_freq >= 0.5 && current_center_freq <= 60)
+            current_minThreshold = -6;
         end
-        success_serial = true;
-    catch
-        warning('Double Precision Non-Parallel processing failed: %s. Switching to LAST RESORT: Single Precision Non-Parallel Processing.');
-    end
-    
-    if ~success_serial
-         disp('Executing Last Resort: Single Precision Non-Parallel Processing...');
-         for f = 1:num_bands_to_process
-            % Extract single band on-the-fly (no full wpt_EEG storage)
-            wavelet_data_band = modwt_single_band(single(unfiltered_data), wavelet_type, actual_decomposition_level, f)';
-            current_epoch_size = epoch_sizes_per_wavelet_band(f);
-            
-            % Determine minThreshold based on signal type and frequency
-            current_center_freq = center_frequencies(f);
-            current_minThreshold = 0;
-            if (current_center_freq >= 0.5 && current_center_freq <= 60)
-                current_minThreshold = -6;
+
+        disp(sprintf('processing wavelet band = %d/%d (%.2g - %.2g Hz)', f, num_bands_to_process, lower_frequencies(f), upper_frequencies(f)))
+        band_source = gedai_source('wavelet', wavelet_approximation, f, actual_decomposition_level);
+
+        % A band that fails before it has written any output is retried in single
+        % precision, as before. Once output has gone into the accumulator a retry
+        % would count part of the band twice, so the error is passed on instead.
+        % (The whole-matrix version fell back to redoing every band in single on
+        % top of an accumulator that already held the finished ones.)
+        output_started = false;
+        for attempt = 1:2
+            try
+                band_state = gedai_band_engine('begin', band_source, srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, [], smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
+                while ~band_state.done
+                    [band_state, band_segment, first, last] = gedai_band_engine('step', band_state);
+                    output_started = true;
+                    % MEMORY OPTIMIZED: Accumulate directly into 2D array
+                    band_sum(first:last, :) = band_sum(first:last, :) + double(band_segment).';
+                end
+                break
+            catch ME
+                if attempt == 2 || output_started
+                    rethrow(ME);
+                end
+                warning('GEDAI_per_band failed for band %d: %s. Retrying with single precision...', f, ME.message);
+                band_source.inputClass = 'single';
             end
-            
-            [cleaned_band_data, ~, sensai_val, thresh_val, enova_val] = GEDAI_per_band(single(wavelet_data_band), srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, [], smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
-            disp(sprintf('processing wavelet band (single) = %d/%d (%.2g - %.2g Hz)', f, num_bands_to_process, lower_frequencies(f), upper_frequencies(f)))
-            
-            % MEMORY OPTIMIZED: Accumulate directly into 2D array
-            wavelet_band_filtered_data = wavelet_band_filtered_data + cleaned_band_data;
-            SENSAI_score_per_band(f+1) = sensai_val;
-            artifact_threshold_per_band(f+1) = mean(thresh_val);
-            artifact_threshold_array_per_band{f+1} = thresh_val;
-            ENOVA_per_band(f+1) = enova_val;
-            
-            % MEMORY OPTIMIZED: Clear band data immediately
-            clear wavelet_data_band cleaned_band_data;
-         end
+        end
+        [sensai_val, thresh_val, enova_val] = gedai_band_engine('finish', band_state);
+        clear band_source band_state band_segment
+
+        SENSAI_score_per_band(f+1) = sensai_val;
+        artifact_threshold_per_band(f+1) = mean(thresh_val);
+        artifact_threshold_array_per_band{f+1} = thresh_val;
+        ENOVA_per_band(f+1) = enova_val;
+
+        % Advance the approximation to level f, in place and a few channels at a
+        % time: exactly modwt_single_band's forward step, which shifts along time
+        % only. (band_source was cleared first so this does not copy the array.)
+        if f < num_bands_to_process
+            shift = 2^(f-1);
+            for c0 = 1:channels_per_piece:num_channels
+                chans = c0:min(num_channels, c0 + channels_per_piece - 1);
+                wavelet_approximation(:, chans) = (wavelet_approximation(:, chans) + circshift(wavelet_approximation(:, chans), shift, 1)) * inv_sqrt2;
+            end
+        end
     end
+    clear wavelet_approximation
+    wavelet_band_filtered_data = band_sum.';
+    clear band_sum
 end
 
-% MEMORY OPTIMIZED: Clear unfiltered data after all wavelet processing
-clear unfiltered_data;
+clear wavelet_approximation
 
 end % broadband_only
 
 %% Finalization: Reconstruct EEG and calculate final scores
 % MEMORY OPTIMIZED: Data already accumulated in 2D array, no summation needed
+% Rebuild the average-referenced, high-passed input released after the
+% broadband pass: same input, same code, same high-pass precision per piece.
+EEGavRef.data = local_prepare_avref(EEGin.data, EEGavRef.nbchan, apply_avg_ref, ...
+    bands_to_zero, wavelet_type, hp_wavelet_levels, piece_bytes, hp_levels);
 EEGclean = EEGavRef;
 EEGclean.data = wavelet_band_filtered_data;  % Already accumulated
+clear wavelet_band_filtered_data
 % Create artifact structure
-EEGartifacts = EEGclean;
-EEGartifacts.data = EEGavRef.data(:, 1:size(EEGclean.data, 2)) - EEGclean.data;
+% It is a third copy of the recording, so it is only formed when something reads
+% it: the output argument, SENSAI scoring (and the epoch rejection that depends
+% on it), the visualisation, or restoring epoched input. ENOVA per channel takes
+% the difference one second at a time instead.
+need_artifacts = nargout > 1 || compute_SENSAI || visualize_artifacts || is_epoched;
+if need_artifacts
+    EEGartifacts = EEGclean;
+    EEGartifacts.data = EEGavRef.data(:, 1:size(EEGclean.data, 2)) - EEGclean.data;
+else
+    EEGartifacts = [];
+end
 
 % Calculate composite SENSAI score for epoch rejection
 noise_multiplier = 1;
@@ -956,22 +947,22 @@ pnts_total = size(EEGclean.data, 2);
 num_epochs_ch = floor(pnts_total / epoch_samples);
 
 if num_epochs_ch > 0
-    new_length = num_epochs_ch * epoch_samples;
-    orig_data_trunc = EEGavRef.data(:, 1:new_length);
-    noise_data_trunc = EEGartifacts.data(:, 1:new_length);
-    
-    orig_epoched = reshape(orig_data_trunc, size(orig_data_trunc, 1), epoch_samples, []);
-    noise_epoched = reshape(noise_data_trunc, size(noise_data_trunc, 1), epoch_samples, []);
-    
-    enova_ch_epochs = zeros(size(orig_data_trunc, 1), num_epochs_ch);
+    % One epoch at a time, straight from EEGavRef and EEGclean: the artifact
+    % signal of an epoch is the same difference EEGartifacts holds, and var()
+    % sees the same channels x samples matrix as when it was cut from the
+    % truncated, reshaped copies of both arrays.
+    enova_ch_epochs = zeros(size(EEGavRef.data, 1), num_epochs_ch);
     for ep = 1:num_epochs_ch
-        var_orig = var(orig_epoched(:,:,ep), 0, 2);
-        var_noise = var(noise_epoched(:,:,ep), 0, 2);
+        cols = (ep-1)*epoch_samples+1 : ep*epoch_samples;
+        orig_epoch = EEGavRef.data(:, cols);
+        var_orig = var(orig_epoch, 0, 2);
+        var_noise = var(orig_epoch - EEGclean.data(:, cols), 0, 2);
         enova_ch_epochs(:, ep) = var_noise ./ var_orig;
     end
+    clear orig_epoch
     ENOVA_per_channel = mean(enova_ch_epochs, 2);
 else
-    var_artifacts_per_channel = var(EEGartifacts.data, 0, 2);
+    var_artifacts_per_channel = var(EEGavRef.data(:, 1:size(EEGclean.data, 2)) - EEGclean.data, 0, 2);
     var_original_per_channel = var(EEGavRef.data(:, 1:size(EEGclean.data, 2)), 0, 2);
     ENOVA_per_channel = var_artifacts_per_channel ./ var_original_per_channel;
 end
@@ -1311,4 +1302,137 @@ if is_epoched
     end
 end
 
+end
+
+% =========================================================================
+function max_offset = local_max_reference_offset(input, piece_bytes)
+%LOCAL_MAX_REFERENCE_OFFSET  max(abs(sum(double(input), 1) / (N + 1))), a block of
+%   samples at a time. Each column sum only involves its own column, so the
+%   result is the same as over the whole double-converted recording.
+N = size(input, 1);
+samples_per_piece = max(1, floor(piece_bytes / (8 * N)));
+max_offset = NaN;          % max() skips NaN, as it did over the whole array
+for s0 = 1:samples_per_piece:size(input, 2)
+    cols = s0:min(size(input, 2), s0 + samples_per_piece - 1);
+    max_offset = max(max_offset, max(abs(sum(double(input(:, cols)), 1) / (N + 1))));
+end
+end
+
+% =========================================================================
+function [data, hp_levels] = local_prepare_avref(input, nbchan, apply_avg_ref, bands_to_zero, ...
+    wavelet_type, hp_wavelet_levels, piece_bytes, hp_levels)
+%LOCAL_PREPARE_AVREF  Double-precision input, average referenced and high-passed.
+%
+%   The same arithmetic as converting the whole recording to double, calling
+%   GEDAI_nonRankDeficientAveRef and removing the low wavelet bands with
+%   modwt_single_band on the transposed recording, done in place and in pieces:
+%   the reference of a sample only involves its own column, and the MODWT only
+%   shifts along time, so every value is unchanged. Only the result and a piece's
+%   temporaries are held, instead of several copies of the recording.
+%
+%   High-pass precision, as before: GPU double -> GPU single -> CPU double ->
+%   CPU single, falling to the next level when one throws. hp_levels (one entry
+%   per channel piece) records the level each piece ran at; pass it back in to
+%   rebuild the signal with the same levels.
+data = double(input);
+
+if apply_avg_ref
+    samples_per_piece = max(1, floor(piece_bytes / (8 * size(data, 1))));
+    for s0 = 1:samples_per_piece:size(data, 2)
+        cols = s0:min(size(data, 2), s0 + samples_per_piece - 1);
+        data(:, cols) = data(:, cols) - sum(data(:, cols), 1) / (nbchan + 1);
+    end
+end
+
+if ~isempty(bands_to_zero)
+    % The MODWT runs on the transposed recording (samples x channels), as before,
+    % where one channel is one contiguous column.
+    warning('off');
+    data = data.';
+    channels_per_piece = max(1, floor(piece_bytes / (8 * size(data, 1))));
+    piece_starts = 1:channels_per_piece:size(data, 2);
+    replay = ~isempty(hp_levels);
+    if ~replay
+        hp_levels = zeros(1, numel(piece_starts));
+    end
+    level = 0;
+    for p = 1:numel(piece_starts)
+        chans = piece_starts(p):min(size(data, 2), piece_starts(p) + channels_per_piece - 1);
+        if replay
+            level = hp_levels(p);
+        end
+        [low_freq_noise, level] = local_hp_noise(data(:, chans), bands_to_zero, ...
+            wavelet_type, hp_wavelet_levels, level);
+        hp_levels(p) = level;
+        data(:, chans) = data(:, chans) - low_freq_noise;
+    end
+    clear low_freq_noise
+    data = data.';
+end
+end
+
+% =========================================================================
+function [low_freq_noise, level] = local_hp_noise(data, bands_to_zero, wavelet_type, hp_wavelet_levels, level)
+%LOCAL_HP_NOISE  Wavelet high-pass noise of a samples x channels piece, in double.
+%   level is the position in the precision cascade, kept across pieces:
+%   0 not started, 1 GPU double, 2 GPU single, 3 CPU double, 4 CPU single.
+%   A level that throws is left for the next one; CPU single has no fallback.
+if level == 0
+    if gpuDeviceCount > 0
+        level = 1;
+        disp('Attempting GPU processing (Double Precision)...');
+        parallel.gpu.enableCUDAForwardCompatibility(true)
+    else
+        level = 3;
+        disp('Attempting CPU processing (Double Precision)...');
+    end
+end
+while true
+    try
+        switch level
+            case 1
+                data_gpu = gpuArray(data);
+                low_freq_noise_gpu = zeros(size(data_gpu), 'like', data_gpu);
+                for b = 1:length(bands_to_zero)
+                    low_freq_noise_gpu = low_freq_noise_gpu + modwt_single_band(data_gpu, wavelet_type, hp_wavelet_levels, bands_to_zero(b));
+                end
+                low_freq_noise = gather(low_freq_noise_gpu);
+            case 2
+                data_gpu = gpuArray(single(data));
+                low_freq_noise_gpu = zeros(size(data_gpu), 'like', data_gpu);
+                for b = 1:length(bands_to_zero)
+                    low_freq_noise_gpu = low_freq_noise_gpu + modwt_single_band(data_gpu, wavelet_type, hp_wavelet_levels, bands_to_zero(b));
+                end
+                low_freq_noise = double(gather(low_freq_noise_gpu));
+            case 3
+                low_freq_noise = zeros(size(data), 'like', data);
+                for b = 1:length(bands_to_zero)
+                    low_freq_noise = low_freq_noise + modwt_single_band(data, wavelet_type, hp_wavelet_levels, bands_to_zero(b));
+                end
+            case 4
+                data_single = single(data);
+                low_freq_noise = zeros(size(data_single), 'like', data_single);
+                for b = 1:length(bands_to_zero)
+                    low_freq_noise = low_freq_noise + modwt_single_band(data_single, wavelet_type, hp_wavelet_levels, bands_to_zero(b));
+                end
+                low_freq_noise = double(low_freq_noise);
+            otherwise
+                error('GEDAI:hpLevel', 'Unknown high-pass precision level %d.', level);
+        end
+        return
+    catch ME
+        switch level
+            case 1
+                warning('GPU (Double) failed. Attempting GPU (Single Precision)...');
+            case 2
+                warning('GPU (Single) failed. Falling back to CPU.');
+                disp('Attempting CPU processing (Double Precision)...');
+            case 3
+                warning('CPU (Double) failed. Attempting CPU (Single Precision)...');
+            otherwise
+                rethrow(ME);
+        end
+        level = level + 1;
+    end
+end
 end

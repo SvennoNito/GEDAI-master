@@ -23,7 +23,6 @@ refCOV_reg = (1-regularization_lambda)*refCOV + regularization_lambda*reg_val*ey
 refCOV_reg = (refCOV_reg + refCOV_reg') / 2;
 
 %% Estimate Signal Quality
-num_chans = size(refCOV, 1);
 epoch_samples = srate * epoch_size;
 
 % Determine the number of top PCs to use based on signal type
@@ -41,23 +40,23 @@ basis_ref = Vref(:, idxRef(1:SSI_top_PCs));
 % --- FIX START: Truncate data to contain a whole number of epochs ---
 pnts = size(signal_data, 2);
 num_epochs_possible = floor(pnts / epoch_samples);
-new_length = num_epochs_possible * epoch_samples;
-
-signal_data = signal_data(:, 1:new_length);
-noise_data = noise_data(:, 1:new_length);
 % --- FIX END ---
 
-% Epoch signal and noise data
-signal_EEG_epoched = reshape(signal_data, num_chans, epoch_samples, []);
-noise_EEG_epoched = reshape(noise_data, num_chans, epoch_samples, []);
-num_epochs = size(signal_EEG_epoched, 3);
+% Each epoch is cut straight from the inputs (the same channels x samples
+% matrix the truncated, reshaped copies used to provide) - those copies were a
+% full recording each.
+num_epochs = num_epochs_possible;
 SIGNAL_subspace_similarity_distribution = zeros(1, num_epochs);
 NOISE_subspace_similarity_distribution = zeros(1, num_epochs);
 ENOVA_per_epoch = zeros(1, num_epochs);
 
 for epoch = 1:num_epochs
+    cols = (epoch-1)*epoch_samples+1 : epoch*epoch_samples;
+    signal_epoch = signal_data(:, cols);
+    noise_epoch  = noise_data(:, cols);
+
     % SIGNAL SUBSPACE: top eigenvectors of signal covariance
-    cov_signal_EEG = cov(signal_EEG_epoched(:,:,epoch)');
+    cov_signal_EEG = cov(signal_epoch');
     cov_signal_EEG = (cov_signal_EEG + cov_signal_EEG') / 2;
     [Vsig, Dsig] = eig(cov_signal_EEG);
     [~, idxSig] = sort(diag(Dsig), 'descend');
@@ -67,7 +66,7 @@ for epoch = 1:num_epochs
     SIGNAL_subspace_similarity_distribution(epoch) = prod(cos_theta_sig);
 
     % NOISE SUBSPACE: top eigenvectors of noise covariance
-    cov_noise = cov(noise_EEG_epoched(:,:,epoch)');
+    cov_noise = cov(noise_epoch');
     cov_noise = (cov_noise + cov_noise') / 2;
     [Vnoise, Dnoise] = eig(cov_noise);
     [~, idxNoise] = sort(diag(Dnoise), 'descend');
@@ -76,9 +75,9 @@ for epoch = 1:num_epochs
     NOISE_subspace_similarity_distribution(epoch) = prod(cos_theta_noise);
 
     % Explained Noise Variance (ENOVA)
-    original_epoch = signal_EEG_epoched(:,:,epoch) + noise_EEG_epoched(:,:,epoch);
+    original_epoch = signal_epoch + noise_epoch;
     var_original = var(original_epoch(:));
-    var_noise = var(reshape(noise_EEG_epoched(:,:,epoch), [], 1));
+    var_noise = var(reshape(noise_epoch, [], 1));
     ENOVA_per_epoch(epoch) = var_noise / var_original;
 end
 
