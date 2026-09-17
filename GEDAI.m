@@ -159,10 +159,28 @@ if nargin < 10 || isempty(ENOVA_threshold_per_channel)
     ENOVA_threshold_per_channel = inf; % If empty, set to infinity to disable rejection
 end
 
-% Parse hidden internal argument (precomputed_ENOVA_per_epoch) for Pass 2 recursion
+% Parse hidden internal arguments. varargin{1} is precomputed_ENOVA_per_epoch (Pass 2
+% recursion). varargin{2} is a struct of caller overrides: it is merged into
+% gedai_band_opts below, and may additionally carry
+%   memory_budget_bytes  what the run may allocate on top of what it already holds.
+%                        Default: what the machine reports free. Set it to model a
+%                        smaller machine than the one running, so the low-memory path
+%                        can be exercised and measured anywhere.
+%   materialise_bands    override the budget decision for the band buffer.
+%   keep_highpass        override the budget decision for the high-passed signal.
+% Anything else in it is passed to the band engine (want_artifacts, precision,
+% block_epochs, force_legacy, verbose, ...). Before this existed the struct was
+% accepted and silently dropped.
 precomputed_ENOVA_per_epoch = [];
+caller_band_opts = struct();
 if ~isempty(varargin)
     precomputed_ENOVA_per_epoch = varargin{1};
+end
+if numel(varargin) > 1 && ~isempty(varargin{2})
+    caller_band_opts = varargin{2};
+    if ~isstruct(caller_band_opts)
+        error('GEDAI:bandOpts', 'The band-options argument must be a struct.');
+    end
 end
 if nargin < 11 || isempty(signal_type)
     signal_type = 'eeg';
@@ -441,13 +459,28 @@ end
 % The input stays in the precision it arrived in, and the double-precision,
 % average-referenced, high-passed signal (EEGavRef.data) is built from it by
 % local_prepare_avref. That signal is read by the broadband pass and, at the
-% very end, for the artifact signal and ENOVA; during the wavelet bands it is
-% released and afterwards rebuilt by the same code from the same input. That
-% costs one more average reference and high-pass, and saves a double copy of
-% the recording for the whole wavelet stage, which is where the memory peaks.
+% very end, for the artifact signal and ENOVA. Whether it is held across the
+% wavelet bands or released and rebuilt afterwards is decided from the memory
+% budget below: holding it costs one double copy of the recording through the
+% stage where memory peaks, rebuilding it costs a second average reference and
+% high-pass. Both give the same values, from the same input and the same code.
 % Work arrays are processed in pieces of about piece_bytes, so that elementwise
 % temporaries never approach the size of the recording.
+%
+% One group-sized double copy, the unit every decision below is measured in.
+group_bytes = numel(EEGin.data) * 8;
+memory_budget = local_memory_budget(caller_band_opts);
+fprintf(['GEDAI memory: one copy of this recording is %.2f GB; budget for new ' ...
+    'allocations is %.2f GB.\n'], group_bytes / 2^30, memory_budget / 2^30);
+
+% Pieces stay small when the budget is tight and widen when it is not: the
+% average reference works one column at a time and the high-pass one channel at
+% a time, so the piece boundary never enters a value, only how many temporaries
+% are alive. 256 MB was the fixed size before.
 piece_bytes = 256 * 2^20;
+if memory_budget > 8 * group_bytes
+    piece_bytes = 2 * 2^30;
+end
 EEGavRef = EEGin;
 EEGavRef.data = [];
 apply_avg_ref = false;
@@ -611,8 +644,10 @@ bands_to_zero = find(upper_bounds <= lowcut_frequency);
 % Average reference (if needed) and wavelet high-pass, into EEGavRef.data.
 % hp_levels records which precision level of the high-pass cascade each piece
 % ran at, so that the rebuild after the wavelet bands repeats exactly this.
+tPhase = tic;
 [EEGavRef.data, hp_levels] = local_prepare_avref(EEGin.data, EEGavRef.nbchan, apply_avg_ref, ...
     bands_to_zero, wavelet_type, hp_wavelet_levels, piece_bytes, []);
+fprintf('[TIME] avref_hp_build %.2f [MEM] %.2f GB\n', toc(tPhase), local_mem_gb());
 
     % ------------------ GEDAI ------------------------------
 
@@ -629,6 +664,16 @@ bands_to_zero = find(upper_bounds <= lowcut_frequency);
                              'legacy_artifacts', false, ...
                              'parallel_blocks', use_block_parallel, ...
                              'precision', 'auto');
+    %% Caller overrides last, so a pipeline can reach the engine's own options.
+    %% The three budget fields are GEDAI's own and are not passed down.
+    caller_fields = fieldnames(caller_band_opts);
+    for iField = 1:numel(caller_fields)
+        if ismember(caller_fields{iField}, ...
+                {'memory_budget_bytes', 'materialise_bands', 'keep_highpass'})
+            continue
+        end
+        gedai_band_opts.(caller_fields{iField}) = caller_band_opts.(caller_fields{iField});
+    end
 
     %% The band passes run through gedai_band_engine rather than GEDAI_per_band:
     %% the engine takes its input as a source and hands back the cleaned band a
@@ -639,7 +684,10 @@ bands_to_zero = find(upper_bounds <= lowcut_frequency);
     broadband_optimization_type = 'parabolic';
     broadband_maxThreshold = 12;
     broadband_source = gedai_source('matrix', EEGavRef.data);
+    tPhase = tic;
     band_state = gedai_band_engine('begin', broadband_source, EEGavRef.srate, EEGavRef.chanlocs, broadband_artifact_threshold_type, broadband_epoch_size, refCOV, broadband_optimization_type, parallel, signal_type, broadband_minThreshold, broadband_maxThreshold, smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
+    fprintf('[TIME] bb_threshold %.2f\n', toc(tPhase));
+    tPhase = tic;
     clear broadband_source
     % Samples x channels: it becomes the level-0 wavelet approximation below,
     % whose per-channel steps want one channel per contiguous column.
@@ -648,10 +696,22 @@ bands_to_zero = find(upper_bounds <= lowcut_frequency);
         [band_state, band_segment, first, last] = gedai_band_engine('step', band_state);
         cleaned_broadband_data(first:last, :) = band_segment.';
     end
+    fprintf('[TIME] bb_clean %.2f [MEM] %.2f GB\n', toc(tPhase), local_mem_gb());
     [broadband_sensai, broadband_thresh, broadband_ENOVA] = gedai_band_engine('finish', band_state);
     clear band_state band_segment
-    % Not needed again until the artifact signal at the end, where it is rebuilt.
-    EEGavRef.data = [];
+    % Holding this across the wavelet bands costs one group-sized double for the
+    % whole stage where memory peaks; releasing it costs a second average
+    % reference and high-pass at the end. Same input, same code, same values.
+    keep_highpass = memory_budget > 3 * group_bytes;
+    if isfield(caller_band_opts, 'keep_highpass')
+        keep_highpass = logical(caller_band_opts.keep_highpass);
+    end
+    if keep_highpass
+        fprintf('GEDAI memory: keeping the high-passed signal (no rebuild at the end).\n');
+    else
+        fprintf('GEDAI memory: releasing the high-passed signal, rebuilt at the end.\n');
+        EEGavRef.data = [];
+    end
     SENSAI_score_per_band = broadband_sensai;
     artifact_threshold_per_band = mean(broadband_thresh);
     artifact_threshold_array_per_band = {broadband_thresh};
@@ -831,9 +891,29 @@ if ~parallel || ~success_parallel
 
     inv_sqrt2 = 1 / sqrt(2);
     channels_per_piece = max(1, floor(piece_bytes / (8 * num_samples)));
-    % MEMORY OPTIMIZED: Accumulate the cleaned bands directly (samples x
-    % channels, like the approximation; transposed once at the end)
-    band_sum = zeros(num_samples, num_channels);
+    % Channels x samples, the shape the engine emits and the shape the output
+    % wants. Held as samples x channels before, which cost a transpose of every
+    % emitted stretch on the way in and one of the whole array on the way out;
+    % the values are the same either way, and a sample's channels are now
+    % contiguous.
+    band_sum = zeros(num_channels, num_samples);
+    % A band read from the approximation is re-synthesised on every read, so
+    % synthesising it once into a buffer and reading slices looks like an obvious
+    % win. Measured on sub-drop0001 ses-t1 (243 ch, four stage groups, whole
+    % recording) it is not: 36.38 min with the buffer against 35.90 min without,
+    % output byte-identical either way. Most bands here have fewer than 500 band
+    % epochs and take the engine's legacy path, which reads the band once anyway,
+    % so the buffer only adds a synthesis and a band-sized array. Off by default;
+    % materialise_bands turns it on for a band mix where the reads do repeat.
+    materialise_bands = false;
+    if isfield(caller_band_opts, 'materialise_bands')
+        materialise_bands = logical(caller_band_opts.materialise_bands);
+    end
+    if materialise_bands
+        fprintf('GEDAI memory: materialising each wavelet band once.\n');
+    else
+        fprintf('GEDAI memory: reading each wavelet band from the approximation.\n');
+    end
     for f = 1:num_bands_to_process
         current_epoch_size = epoch_sizes_per_wavelet_band(f);
 
@@ -845,7 +925,17 @@ if ~parallel || ~success_parallel
         end
 
         disp(sprintf('processing wavelet band = %d/%d (%.2g - %.2g Hz)', f, num_bands_to_process, lower_frequencies(f), upper_frequencies(f)))
-        band_source = gedai_source('wavelet', wavelet_approximation, f, actual_decomposition_level);
+        tPhase = tic;
+        if materialise_bands
+            band_class = local_band_class(gedai_band_opts.precision, ...
+                round(srate * current_epoch_size), num_channels);
+            band_matrix = gedai_wavelet_band(wavelet_approximation, f, ...
+                actual_decomposition_level, band_class);
+            band_source = gedai_source('matrix_tc', band_matrix);
+        else
+            band_source = gedai_source('wavelet', wavelet_approximation, f, actual_decomposition_level);
+        end
+        tThisSource = toc(tPhase);
 
         % A band that fails before it has written any output is retried in single
         % precision, as before. Once output has gone into the accumulator a retry
@@ -855,13 +945,20 @@ if ~parallel || ~success_parallel
         output_started = false;
         for attempt = 1:2
             try
+                tPhase = tic;
                 band_state = gedai_band_engine('begin', band_source, srate, EEGavRef.chanlocs, artifact_threshold_type, current_epoch_size, refCOV, 'parabolic', false, signal_type, current_minThreshold, [], smoothing_window_seconds, percentile_threshold, [], gedai_band_opts);
+                tThisBegin = toc(tPhase);
+                tPhase = tic; tThisAcc = 0;
                 while ~band_state.done
                     [band_state, band_segment, first, last] = gedai_band_engine('step', band_state);
                     output_started = true;
                     % MEMORY OPTIMIZED: Accumulate directly into 2D array
-                    band_sum(first:last, :) = band_sum(first:last, :) + double(band_segment).';
+                    tAcc = tic;
+                    band_sum(:, first:last) = band_sum(:, first:last) + double(band_segment);
+                    tThisAcc = tThisAcc + toc(tAcc);
                 end
+                fprintf('[TIME] band %d source %.2f threshold %.2f clean %.2f accumulate %.2f [MEM] %.2f GB\n', ...
+                    f, tThisSource, tThisBegin, toc(tPhase) - tThisAcc, tThisAcc, local_mem_gb());
                 break
             catch ME
                 if attempt == 2 || output_started
@@ -869,10 +966,14 @@ if ~parallel || ~success_parallel
                 end
                 warning('GEDAI_per_band failed for band %d: %s. Retrying with single precision...', f, ME.message);
                 band_source.inputClass = 'single';
+                if materialise_bands
+                    band_matrix = single(band_matrix);
+                    band_source = gedai_source('matrix_tc', band_matrix);
+                end
             end
         end
         [sensai_val, thresh_val, enova_val] = gedai_band_engine('finish', band_state);
-        clear band_source band_state band_segment
+        clear band_source band_state band_segment band_matrix
 
         SENSAI_score_per_band(f+1) = sensai_val;
         artifact_threshold_per_band(f+1) = mean(thresh_val);
@@ -891,7 +992,7 @@ if ~parallel || ~success_parallel
         end
     end
     clear wavelet_approximation
-    wavelet_band_filtered_data = band_sum.';
+    wavelet_band_filtered_data = band_sum;
     clear band_sum
 end
 
@@ -901,10 +1002,13 @@ end % broadband_only
 
 %% Finalization: Reconstruct EEG and calculate final scores
 % MEMORY OPTIMIZED: Data already accumulated in 2D array, no summation needed
-% Rebuild the average-referenced, high-passed input released after the
-% broadband pass: same input, same code, same high-pass precision per piece.
-EEGavRef.data = local_prepare_avref(EEGin.data, EEGavRef.nbchan, apply_avg_ref, ...
-    bands_to_zero, wavelet_type, hp_wavelet_levels, piece_bytes, hp_levels);
+% Rebuild the average-referenced, high-passed input if it was released after the
+% broadband pass: same input, same code, same high-pass precision per piece. When
+% the budget allowed it to be held, it is already here and this is skipped.
+if isempty(EEGavRef.data)
+    EEGavRef.data = local_prepare_avref(EEGin.data, EEGavRef.nbchan, apply_avg_ref, ...
+        bands_to_zero, wavelet_type, hp_wavelet_levels, piece_bytes, hp_levels);
+end
 EEGclean = EEGavRef;
 EEGclean.data = wavelet_band_filtered_data;  % Already accumulated
 clear wavelet_band_filtered_data
@@ -1304,6 +1408,74 @@ end
 
 end
 
+% =========================================================================
+function gb = local_mem_gb()
+%LOCAL_MEM_GB  What this MATLAB process currently holds, in GB.
+%   Measured inside the process, because the machine is shared: an external
+%   working-set reading cannot tell this run's arrays from a neighbour's.
+gb = NaN;
+try
+    if ispc
+        m = memory;
+        gb = m.MemUsedMATLAB / 2^30;
+    else
+        txt = fileread(sprintf('/proc/%d/statm', feature('getpid')));
+        pages = sscanf(txt, '%f');
+        gb = pages(2) * 4096 / 2^30;   % resident pages
+    end
+catch
+end
+end
+% =========================================================================
+function budget = local_memory_budget(caller_band_opts)
+%LOCAL_MEMORY_BUDGET  Bytes this run may allocate on top of what it holds.
+%   memory_budget_bytes in the caller's band-options struct wins, which is how a
+%   64 GB machine's behaviour is reproduced and measured on a larger one. Without
+%   it the machine is asked: MEMORY on Windows, /proc/meminfo elsewhere. When
+%   neither answers, the budget is 0, i.e. the low-memory path, because
+%   over-committing is the failure that loses a whole recording.
+if isfield(caller_band_opts, 'memory_budget_bytes') ...
+        && ~isempty(caller_band_opts.memory_budget_bytes)
+    budget = double(caller_band_opts.memory_budget_bytes);
+    return
+end
+budget = 0;
+try
+    if ispc
+        m = memory;
+        budget = m.MaxPossibleArrayBytes;
+    else
+        txt = fileread('/proc/meminfo');
+        tok = regexp(txt, 'MemAvailable:\s+(\d+) kB', 'tokens', 'once');
+        if ~isempty(tok)
+            budget = str2double(tok{1}) * 1024;
+        end
+    end
+catch
+    budget = 0;
+end
+end
+
+% =========================================================================
+function cls = local_band_class(precision, Te, N)
+%LOCAL_BAND_CLASS  The class a band pass will work in, for pre-building its data.
+%   Mirrors the precision policy in gedai_band_engine: 'auto' uses single only
+%   where the band epoch is longer than the channel count. A band buffer built in
+%   the wrong class would be cast on every read, so this has to agree with the
+%   engine.
+switch lower(precision)
+    case 'single'
+        cls = 'single';
+    case 'auto'
+        if Te > N
+            cls = 'single';
+        else
+            cls = 'double';
+        end
+    otherwise
+        cls = 'double';
+end
+end
 % =========================================================================
 function max_offset = local_max_reference_offset(input, piece_bytes)
 %LOCAL_MAX_REFERENCE_OFFSET  max(abs(sum(double(input), 1) / (N + 1))), a block of
