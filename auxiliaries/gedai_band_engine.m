@@ -88,7 +88,7 @@ if isempty(rank_truncation), rank_truncation = true; end
 if isempty(opts), opts = struct; end
 def = struct('want_artifacts', true, 'force_legacy', false, 'artifact_threshold_override', [], ...
              'precision', 'double', 'block_epochs', [], 'parallel_blocks', false, 'verbose', false, ...
-             'legacy_artifacts', true);
+             'legacy_artifacts', true, 'thresh_plausibility_gate', 0);
 fn = fieldnames(def);
 for i = 1:numel(fn)
     if ~isfield(opts, fn{i}), opts.(fn{i}) = def.(fn{i}); end
@@ -118,6 +118,25 @@ if use_single && strcmp(cls, 'double')
     cls       = 'single';
     refCOV    = single(refCOV);
     cast_back = true;   % the caller accumulates bands in double
+end
+
+% ---- optional plausibility floor -----------------------------------------
+% A fixed, scale-free floor under the threshold: a component whose topography
+% needs no more than opts.thresh_plausibility_gate leadfield principal
+% components to reach 90% of its energy is never removed, whatever the
+% threshold says. See local_npc90 (stream path) / clean_EEG_epoch (legacy
+% path). Built once here, in the band's working precision, since both paths
+% need it identically. gate = 0 (default) disables it and reproduces the
+% previous behaviour exactly; it can only ever remove less, never more.
+gate = opts.thresh_plausibility_gate;
+if isempty(gate), gate = 0; end
+if gate > 0
+    [Ulf_, Dlf_] = eig(double(refCOV));
+    [~, oLf] = sort(diag(Dlf_), 'descend');
+    Ulf = cast(Ulf_(:, oLf), 'like', refCOV);
+    clear Ulf_ Dlf_
+else
+    Ulf = [];
 end
 
 % The streaming path pays for itself only when there are many epochs. Its
@@ -154,6 +173,8 @@ state.artifact_threshold_override = opts.artifact_threshold_override;
 state.verbose = opts.verbose;
 state.done = false;
 state.t_clean = 0;
+state.gate = gate;
+state.Ulf = Ulf;
 
 % A wavelet band is reconstructed here, once, in the working precision, and
 % read back in slices; reconstructing it per read repeats the synthesis for
@@ -473,6 +494,7 @@ segs = cell(1, nT); sgs = cell(1, nT); ngs = cell(1, nT);
 R_chol = state.R_chol; B = state.B; r = state.r; truncated = state.truncated;
 cut_1 = state.cut_1; cut_2 = state.cut_2; cw = state.cosine_weights;
 Template_guess = state.Template_guess; T_proj = state.T_proj; M_ssi = state.M_ssi;
+Ulf = state.Ulf; gate = state.gate;
 
 pj = find(onPool);
 if ~isempty(pj)
@@ -482,10 +504,10 @@ if ~isempty(pj)
     parfor j = 1:m
         if pg(j) == 1
             [pseg{j}, psg{j}, png{j}] = local_clean_block(pX{j}, pcs(j), pce(j), K, Te, R_chol, B, r, ...
-                truncated, N, cut_1, cw, true, Template_guess, T_proj, M_ssi, pU{j}, pD{j});
+                truncated, N, cut_1, cw, true, Template_guess, T_proj, M_ssi, pU{j}, pD{j}, Ulf, gate);
         else
             [pseg{j}, psg{j}, png{j}] = local_clean_block(pX{j}, pcs(j), pce(j), K2, Te, R_chol, B, r, ...
-                truncated, N, cut_2, cw, false, [], [], M_ssi, pU{j}, pD{j});
+                truncated, N, cut_2, cw, false, [], [], M_ssi, pU{j}, pD{j}, Ulf, gate);
         end
     end
     segs(pj) = pseg; sgs(pj) = psg; ngs(pj) = png;
@@ -494,10 +516,10 @@ end
 for j = find(~onPool)
     if grid(j) == 1
         [segs{j}, sgs{j}, ngs{j}] = local_clean_block(Xb{j}, css(j), ces(j), K, Te, R_chol, B, r, ...
-            truncated, N, cut_1, cw, true, Template_guess, T_proj, M_ssi, Ub{j}, Db{j});
+            truncated, N, cut_1, cw, true, Template_guess, T_proj, M_ssi, Ub{j}, Db{j}, Ulf, gate);
     else
         [segs{j}, sgs{j}, ngs{j}] = local_clean_block(Xb{j}, css(j), ces(j), K2, Te, R_chol, B, r, ...
-            truncated, N, cut_2, cw, false, [], [], M_ssi, Ub{j}, Db{j});
+            truncated, N, cut_2, cw, false, [], [], M_ssi, Ub{j}, Db{j}, Ulf, gate);
     end
 end
 clear Ub Db
@@ -603,7 +625,7 @@ end
 % =====================================================================
 function [seg, sig_b, noi_b, nb_sum, nb_max] = local_clean_block( ...
     Xblk, cs, ce, K, Te, R_chol, B, r, truncated, N, cut, cosine_weights, ...
-    do_sensai, Template_guess, T_proj, M_ssi, Utop, Dtop)
+    do_sensai, Template_guess, T_proj, M_ssi, Utop, Dtop, Ulf, gate)
 %LOCAL_CLEAN_BLOCK  One block of epochs, given that block's samples.
 %   Depends on nothing outside itself except the (already fixed) threshold and
 %   the two global epoch indices used by the cosine edge rule, which is what
@@ -670,21 +692,47 @@ for k = 1:c
         d_all = d;
     end
 
-    num_bad = numel(bad);
-    nb_sum  = nb_sum + num_bad;
-    nb_max  = max(nb_max, num_bad);
-
     Xk = D3(:,:,k);
-    if num_bad > 0
+    if ~isempty(bad)
         V_bad = R_chol \ U;               % back-transform only what is removed
         d_bad = abs(d_all(bad));
+        d_bad = d_bad(:);
+        if gate > 0
+            %%% Plausibility floor. The threshold is an amplitude criterion, and
+            %%% amplitude does not separate brain from artifact - a slow wave and a
+            %%% movement artifact are both large. That is why the threshold has to be
+            %%% adapted at all, and adapting it is what makes the same eigenvalue
+            %%% removable in one window and not another. This is the one part of the
+            %%% decision that is scale-free, and therefore means the same thing
+            %%% everywhere: a component whose topography lives in a handful of leadfield
+            %%% directions is a dipolar source and is kept, whatever the threshold says.
+            %%%
+            %%% Measured on one night: slow waves need 7 leadfield PCs, K-complexes 5,
+            %%% spindles 5, wake alpha 8, while the components GEDAI removes in wake need
+            %%% ~180. At a gate of 15 nothing GEDAI removes in wake is released.
+            %%% It cannot REPLACE the threshold - once both populations are above the cut
+            %%% they overlap badly (AUC ~0.75) - so it is a floor only, and by
+            %%% construction it can remove less, never more.
+            keepBad = local_npc90(B, V_bad, Ulf) > gate;
+            V_bad = V_bad(:, keepBad);
+            % Indexing a single-element vector with an all-false logical collapses
+            % to 0x0 rather than 0x1 (a MATLAB quirk), which breaks the (num_bad x
+            % M_ssi) broadcast in local_sensai_epoch below. Force the column shape.
+            d_bad = reshape(d_bad(keepBad(:)), [], 1);
+        end
+    else
+        V_bad = zeros(N, 0, 'like', Xblk); d_bad = zeros(0, 1, 'like', Xblk);
+    end
+
+    num_bad = size(V_bad, 2);
+    nb_sum  = nb_sum + num_bad;
+    nb_max  = max(nb_max, num_bad);
+    if num_bad > 0
         if num_bad <= Te
             Xk = Xk - (B * V_bad) * (V_bad' * Xk);
         else
             Xk = Xk - B * (V_bad * (V_bad' * Xk));
         end
-    else
-        V_bad = zeros(N, 0, 'like', Xblk); d_bad = zeros(0, 1, 'like', Xblk);
     end
 
     if do_sensai
@@ -702,6 +750,24 @@ for k = 1:c
     end
     seg(:, (k-1)*Te+1 : k*Te) = Xk;
 end
+end
+
+% =====================================================================
+function npc = local_npc90(B, V, Ulf)
+%LOCAL_NPC90  How dipolar each component is, on a scale that does not depend on its size.
+%
+%   For generalized eigenvector v the activation pattern - the map that actually gets
+%   subtracted - is a = B*v. Expanded in the eigenbasis of the leadfield gram, a smooth
+%   dipolar field concentrates in the leading directions while a single-channel pop or a
+%   muscle burst spreads thinly over all of them. Returned is the number of leadfield
+%   principal components needed to reach 90 % of the map's energy: invariant to the
+%   component's amplitude, and therefore the same criterion in every window and stage.
+A = B * V;
+nrm = sqrt(sum(A.^2, 1)); nrm(nrm == 0) = 1;
+A = A ./ nrm;
+E = (Ulf' * A).^2;
+C = cumsum(E, 1) ./ max(sum(E, 1), realmin);
+npc = sum(C < 0.90, 1) + 1;
 end
 
 % =====================================================================
@@ -934,6 +1000,7 @@ function state = local_legacy_begin(state, src, refCOV, artifact_threshold_type,
 
 N_EEG_electrodes = state.N; epoch_samples = state.Te; cls = state.cls;
 N_epochs = state.K;
+Ulf = state.Ulf; gate = state.gate;
 
 if state.K2 == 0
     % The matrix code failed here too, one step later: the shifted grid is
@@ -1111,7 +1178,7 @@ At = zeros(N_EEG_electrodes, (P - len) * keep_tail, cls); % the rest, only for t
 for i = 1:N_epochs
     s0 = (i-1) * epoch_samples;
     X  = gedai_read(src, s0 + 1, s0 + epoch_samples, cls);
-    [cl, ar] = clean_EEG_epoch(X, i, N_epochs, mag_1, thr_1, Evec, refCOV_reg, cosine_weights, epoch_samples);
+    [cl, ar] = clean_EEG_epoch(X, i, N_epochs, mag_1, thr_1, Evec, refCOV_reg, cosine_weights, epoch_samples, Ulf, gate);
     n  = min(epoch_samples, P - s0);
     nA = max(0, min(n, len - s0));
     C(:, s0+1:s0+n)  = cl(:, 1:n);
@@ -1127,7 +1194,7 @@ clear Evald_2
 for i = 1:K2
     s0 = sh + (i-1) * epoch_samples;
     X  = gedai_read(src, s0 + 1, s0 + epoch_samples, cls);
-    [cl, ar] = clean_EEG_epoch(X, i, K2, mag_2, thr_2, Evec_2, refCOV_reg, cosine_weights, epoch_samples);
+    [cl, ar] = clean_EEG_epoch(X, i, K2, mag_2, thr_2, Evec_2, refCOV_reg, cosine_weights, epoch_samples, Ulf, gate);
     % Edge weighting of the shifted grid, cleaned then artifacts as before
     if i == 1
         cl(:, 1:sh) = cl(:, 1:sh) .* cosine_weights(:, 1:sh);
