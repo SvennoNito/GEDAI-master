@@ -129,7 +129,7 @@
 % For any questions, please contact:
 % dr.t.ros@gmail.com
 
-function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel]=GEDAI(EEGin, artifact_threshold_type, broadband_artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, broadband_epoch_size, broadband_only, percentile_threshold, broadband_minThreshold, compute_SENSAI, varargin)
+function [EEGclean, EEGartifacts, SENSAI_score, SENSAI_score_per_band, artifact_threshold_per_band, mean_ENOVA, ENOVA_per_epoch, com, ENOVA_per_band, ENOVA_per_channel, bandRemovedField]=GEDAI(EEGin, artifact_threshold_type, broadband_artifact_threshold_type, epoch_size_in_cycles, lowcut_frequency, ref_matrix_type, parallel, visualize_artifacts, ENOVA_threshold_per_epoch, ENOVA_threshold_per_channel, signal_type, smoothing_window_seconds, broadband_epoch_size, broadband_only, percentile_threshold, broadband_minThreshold, compute_SENSAI, varargin)
 
 if nargin < 2 || isempty(artifact_threshold_type)
     artifact_threshold_type = 'auto';
@@ -223,6 +223,30 @@ signal_type = lower(signal_type);
 use_block_parallel = (ischar(parallel) || isstring(parallel)) && strcmpi(char(parallel), 'blocks');
 if use_block_parallel
     parallel = false;
+end
+
+%%% Per-band removed-field capture (multivariate-prep issue #25, ADR 0004): opt-in and
+%%% windows-only. bandRemovedField defaults to {} so every return path - including the
+%%% two-pass bad-channel mode's early return below, which this feature does not thread
+%%% into - has it defined. capture_windows is [nWin x 2] (sampleStart, sampleEnd) in
+%%% EEGin's own absolute column space; passing none (the default) means gedai_band_opts
+%%% below carries capture_windows = zeros(0, 2), which costs gedai_band_engine nothing.
+bandRemovedField = {};
+capture_windows = zeros(0, 2);
+if isfield(caller_band_opts, 'capture_windows') && ~isempty(caller_band_opts.capture_windows)
+    capture_windows = caller_band_opts.capture_windows;
+end
+if ~isempty(capture_windows)
+    if ENOVA_threshold_per_channel < inf
+        error('GEDAI:captureWindowsUnsupported', ...
+            ['CaptureWindows (multivariate-prep issue #25) is not supported together with the ' ...
+             'two-pass bad-channel rejection mode (ENOVA_threshold_per_channel < Inf).']);
+    end
+    if parallel && ~use_block_parallel
+        error('GEDAI:captureWindowsUnsupported', ...
+            ['CaptureWindows (multivariate-prep issue #25) requires the serial wavelet-band loop ' ...
+             '(parallel = ''blocks''); the band-parallel loop does not return per-band captures.']);
+    end
 end
 
 p = fileparts(which('GEDAI'));
@@ -697,7 +721,7 @@ fprintf('[TIME] avref_hp_build %.2f [MEM] %.2f GB\n', toc(tPhase), local_mem_gb(
         cleaned_broadband_data(first:last, :) = band_segment.';
     end
     fprintf('[TIME] bb_clean %.2f [MEM] %.2f GB\n', toc(tPhase), local_mem_gb());
-    [broadband_sensai, broadband_thresh, broadband_ENOVA] = gedai_band_engine('finish', band_state);
+    [broadband_sensai, broadband_thresh, broadband_ENOVA, broadband_captured] = gedai_band_engine('finish', band_state);
     clear band_state band_segment
     % Holding this across the wavelet bands costs one group-sized double for the
     % whole stage where memory peaks; releasing it costs a second average
@@ -716,6 +740,12 @@ fprintf('[TIME] avref_hp_build %.2f [MEM] %.2f GB\n', toc(tPhase), local_mem_gb(
     artifact_threshold_per_band = mean(broadband_thresh);
     artifact_threshold_array_per_band = {broadband_thresh};
     ENOVA_per_band = broadband_ENOVA;
+    %%% Removed-field capture (issue #25, ADR 0004): grown by index exactly like
+    %%% artifact_threshold_array_per_band above - band_removed_field{1} is broadband,
+    %%% band_removed_field{f+1} is wavelet band f, each holding gedai_band_engine's
+    %%% captured cell array (one entry per capture_windows row, empty when
+    %%% capture_windows is empty).
+    band_removed_field = {broadband_captured};
 
 if broadband_only
     disp('Broadband-only mode: skipping wavelet band decomposition.');
@@ -972,13 +1002,14 @@ if ~parallel || ~success_parallel
                 end
             end
         end
-        [sensai_val, thresh_val, enova_val] = gedai_band_engine('finish', band_state);
+        [sensai_val, thresh_val, enova_val, band_captured_f] = gedai_band_engine('finish', band_state);
         clear band_source band_state band_segment band_matrix
 
         SENSAI_score_per_band(f+1) = sensai_val;
         artifact_threshold_per_band(f+1) = mean(thresh_val);
         artifact_threshold_array_per_band{f+1} = thresh_val;
         ENOVA_per_band(f+1) = enova_val;
+        band_removed_field{f+1} = band_captured_f;
 
         % Advance the approximation to level f, in place and a few channels at a
         % time: exactly modwt_single_band's forward step, which shifts along time
@@ -999,6 +1030,14 @@ end
 clear wavelet_approximation
 
 end % broadband_only
+
+%%% Pad band_removed_field to one entry per processed band (issue #25, ADR 0004): the
+%%% classic band-parallel loop above (parallel = true, not 'blocks') does not populate
+%%% per-band entries past the broadband one - capture_windows is guarded to be empty
+%%% whenever that loop runs, so the padding is always {} there, never a silent gap.
+if numel(band_removed_field) < num_bands_to_process + 1
+    band_removed_field(numel(band_removed_field) + 1 : num_bands_to_process + 1) = {cell(0, 1)};
+end
 
 %% Finalization: Reconstruct EEG and calculate final scores
 % MEMORY OPTIMIZED: Data already accumulated in 2D array, no summation needed
@@ -1405,6 +1444,8 @@ if is_epoched
         warning('Data length changed (e.g., due to epoch rejection). Cannot cleanly restore 3D structure. Returning data as continuous.');
     end
 end
+
+bandRemovedField = band_removed_field;
 
 end
 

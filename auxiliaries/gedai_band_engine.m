@@ -9,7 +9,7 @@ function varargout = gedai_band_engine(action, varargin)
 %       [state, seg, first, last, artifacts] = gedai_band_engine('step', state);
 %       % seg holds cleaned samples first..last, in the working precision
 %   end
-%   [SENSAI_score, artifact_threshold_out, ENOVA] = gedai_band_engine('finish', state);
+%   [SENSAI_score, artifact_threshold_out, ENOVA, captured] = gedai_band_engine('finish', state);
 %
 %   This is GEDAI_per_band's computation, reorganised around memory. The matrix
 %   version took the band as a matrix, returned the cleaned band as a matrix,
@@ -40,6 +40,17 @@ function varargout = gedai_band_engine(action, varargin)
 %     .legacy_artifacts  return artifacts on the legacy path even when
 %                        want_artifacts is false (default true, which is what
 %                        GEDAI_per_band always did). GEDAI.m sets false.
+%     .capture_windows   [nWin x 2] (sampleStart, sampleEnd), this band's own absolute
+%                        1..P sample space (the same space 'step' reports first/last
+%                        in), one row per window whose removed field the caller wants
+%                        back - opt-in and windows-only (multivariate-prep issue #25,
+%                        ADR 0004): passing zeros(0, 2) (the default) costs nothing,
+%                        since the whole-segment/whole-band artifact arrays this would
+%                        otherwise need are never built for want_artifacts = false (see
+%                        local_capture_stream, local_capture_legacy). 'finish' returns
+%                        one entry per row, in the same order, each an [N x winLen]
+%                        matrix in the band's working precision ([] rows are never
+%                        produced - every row must fall inside this band's [1, P]).
 %   state.cls is the working precision; state.cast_back is true when the band
 %   ran in single although its input was double.
 %
@@ -88,7 +99,10 @@ if isempty(rank_truncation), rank_truncation = true; end
 if isempty(opts), opts = struct; end
 def = struct('want_artifacts', true, 'force_legacy', false, 'artifact_threshold_override', [], ...
              'precision', 'double', 'block_epochs', [], 'parallel_blocks', false, 'verbose', false, ...
-             'legacy_artifacts', true, 'thresh_plausibility_gate', 0);
+             'legacy_artifacts', true, 'thresh_plausibility_gate', 0, ...
+             'thresh_window_min_epochs', 30, 'thresh_window_max_epochs', 200, ...
+             'thresh_window_recalibrate', false, 'thresh_window_aggregate', 'mean', ...
+             'capture_windows', zeros(0, 2));
 fn = fieldnames(def);
 for i = 1:numel(fn)
     if ~isfield(opts, fn{i}), opts.(fn{i}) = def.(fn{i}); end
@@ -145,8 +159,15 @@ end
 % the same epochs twice over, and the legacy path - one decomposition, kept -
 % is simply the better algorithm. Long-epoch bands are exactly that case, and
 % their stored eigenbasis is small because K = T/Te is small.
+%
+% A finite smoothing_window_seconds used to force the legacy path, which is what
+% made the sliding threshold unusable on a whole night: legacy keeps Evec for
+% every epoch (N x r x K), and on the fast bands of an 8 h recording that is tens
+% of terabytes. local_windowed_threshold (below) optimises the threshold per
+% window itself on the streaming path, so the sliding threshold and the
+% streaming path are no longer exclusive.
 epochs_in_band = floor(P / Te);
-use_stream = isinf(smoothing_window_seconds) && ~opts.force_legacy && ...
+use_stream = ~opts.force_legacy && ...
              (ischar(optimization_type) && strcmp(optimization_type, 'parabolic')) && ...
              epochs_in_band > 500;
 
@@ -175,6 +196,19 @@ state.done = false;
 state.t_clean = 0;
 state.gate = gate;
 state.Ulf = Ulf;
+state.smoothing_window_seconds = smoothing_window_seconds;
+state.thresh_window_min_epochs = opts.thresh_window_min_epochs;
+state.thresh_window_aggregate  = opts.thresh_window_aggregate;
+%%% Removed-field capture (multivariate-prep issue #25, ADR 0004): a small,
+%%% windows-sized accumulator per requested window, never a segment- or
+%%% band-sized one. Empty by default (opts.capture_windows = zeros(0, 2)), so
+%%% this loop does not run and production pays nothing.
+state.capture_windows = opts.capture_windows;
+state.captured = cell(size(state.capture_windows, 1), 1);
+for iCap = 1:size(state.capture_windows, 1)
+    wS = state.capture_windows(iCap, 1); wE = state.capture_windows(iCap, 2);
+    state.captured{iCap} = zeros(N, wE - wS + 1, cls);
+end
 
 % A wavelet band is reconstructed here, once, in the working precision, and
 % read back in slices; reconstructing it per read repeats the synthesis for
@@ -226,7 +260,7 @@ state.t_clean = state.t_clean + toc(tS);
 end
 
 % =====================================================================
-function [SENSAI_score, artifact_threshold_out, ENOVA] = local_finish(state)
+function [SENSAI_score, artifact_threshold_out, ENOVA, captured] = local_finish(state)
 if ~state.done
     error('gedai_band_engine:notDone', 'finish called before the last step.');
 end
@@ -249,6 +283,7 @@ switch state.path
     otherwise
         error('gedai_band_engine:path', 'Unknown path ''%s''.', state.path);
 end
+captured = state.captured;
 end
 
 % =====================================================================
@@ -281,6 +316,8 @@ function state = local_stream_begin(state, refCOV, artifact_threshold_type, opti
 
 N = state.N; Te = state.Te; K = state.K; K2 = state.K2; sh = state.sh; cls = state.cls;
 src = state.src;
+epoch_size = state.epoch_size;
+smoothing_window_seconds = state.smoothing_window_seconds;
 
 %% ---- regularized reference covariance, factored once -------------------
 regularization_lambda = 0.05;
@@ -329,17 +366,43 @@ end
 %% ================= STAGE A : threshold ==================================
 tA = tic;
 
-% (A1) SENSAI subsample. Drawn exactly as SENSAI_fminbnd would have drawn it
-% from the full set, so the optimiser sees the same epochs in the same order
-% and returns the same threshold.
+% (A1) Exact global eigenvalue percentile, per grid, from an
+% eigenvalues-only pass. Cheaper than the decomposition with vectors, and it
+% reproduces what clean_EEG computed from the full stored spectrum.
+% When the epoch is longer than the channel count there is no cheap
+% eigenvalues-only route: eig(N x N) without vectors still costs ~60% of the
+% full decomposition, so redoing it in the cleaning stage would be a net loss.
+% In that regime the pre-pass keeps the leading eigenvectors as well, and the
+% cleaning stage becomes pure application. Those bands have few epochs
+% (K = T/Te), so the cache is small. For the short-epoch bands the opposite
+% holds: the Gram route is cheap and K is large, so nothing is kept.
+%
+% This runs BEFORE the threshold is chosen: it does not depend on it, and the
+% windowed optimiser below needs the global percentile in order to state its
+% per-window thresholds on the same scale the cleaning stage applies them.
+keep_vectors = ~truncated;
+k_keep = min(r, 32);
+
+[Evald_all_1, Utop_1, Dtop_1] = local_gevd_prepass(src, cls, 0, Te, R_chol, r, truncated, N, K, opts, keep_vectors, k_keep);
+if K2 > 0
+    [Evald_all_2, Utop_2, Dtop_2] = local_gevd_prepass(src, cls, sh, Te, R_chol, r, truncated, N, K2, opts, keep_vectors, k_keep);
+else
+    Evald_all_2 = []; Utop_2 = []; Dtop_2 = [];
+end
+
+% (A2) The artifact threshold t.
 if ~isempty(opts.artifact_threshold_override)
     % Threshold supplied by the caller. Besides making the cleaning stage
     % testable in isolation, this is the only way to give two datasets the
     % same operating point: SENSAI is flat over a wide range, so letting it
     % re-optimise per run makes the amount removed depend on what else is in
     % the file.
-    artifact_threshold_scalar = opts.artifact_threshold_override;
-else
+    artifact_threshold = repmat(opts.artifact_threshold_override, 1, K);
+
+elseif isinf(smoothing_window_seconds)
+    % One threshold for the whole band. SENSAI subsample drawn exactly as
+    % SENSAI_fminbnd would have drawn it from the full set, so the optimiser sees
+    % the same epochs in the same order and returns the same threshold.
     max_number_of_epochs = 500;
     if K > max_number_of_epochs
         randStream  = RandStream('mt19937ar', 'Seed', 2);
@@ -359,40 +422,38 @@ else
                   'Only the ''parabolic'' optimizer is supported on the streaming path.');
     end
     clear Evec_s Evald_s
+    artifact_threshold = repmat(artifact_threshold_scalar, 1, K);
+
+else
+    if ~(ischar(optimization_type) && strcmp(optimization_type, 'parabolic'))
+        error('gedai_band_engine:optimization', ...
+              'Only the ''parabolic'' optimizer is supported on the streaming path.');
+    end
+    artifact_threshold = local_windowed_threshold(src, cls, 0, K, Te, R_chol, r, ...
+        truncated, N, refCOV, minThreshold, maxThreshold, noise_multiplier, ...
+        evecs_Template_cov, signal_type, SSI_top_PCs, percentile_threshold, ...
+        epoch_size, smoothing_window_seconds, pct, Evald_all_1, opts);
 end
 
-artifact_threshold_scalar = max(minThreshold, min(maxThreshold, artifact_threshold_scalar));
-artifact_threshold   = repmat(artifact_threshold_scalar, 1, K);
+artifact_threshold   = max(minThreshold, min(maxThreshold, artifact_threshold));
 artifact_threshold_2 = (artifact_threshold(1:end-1) + artifact_threshold(2:end)) / 2;
 if isempty(artifact_threshold_2), artifact_threshold_2 = artifact_threshold; end
 
-% (A2) Exact global eigenvalue percentile, per grid, from an
-% eigenvalues-only pass. Cheaper than the decomposition with vectors, and it
-% reproduces what clean_EEG computed from the full stored spectrum.
-% When the epoch is longer than the channel count there is no cheap
-% eigenvalues-only route: eig(N x N) without vectors still costs ~60% of the
-% full decomposition, so redoing it in the cleaning stage would be a net loss.
-% In that regime the pre-pass keeps the leading eigenvectors as well, and the
-% cleaning stage becomes pure application. Those bands have few epochs
-% (K = T/Te), so the cache is small. For the short-epoch bands the opposite
-% holds: the Gram route is cheap and K is large, so nothing is kept.
-keep_vectors = ~truncated;
-k_keep = min(r, 32);
-
-[Evald_all_1, Utop_1, Dtop_1] = local_gevd_prepass(src, cls, 0, Te, R_chol, r, truncated, N, K, opts, keep_vectors, k_keep);
 T1_1 = (105 - artifact_threshold) / 100;
 cut_1 = gedai_eig_threshold(Evald_all_1, N, pct, T1_1);
 clear Evald_all_1
 
 if K2 > 0
-    [Evald_all_2, Utop_2, Dtop_2] = local_gevd_prepass(src, cls, sh, Te, R_chol, r, truncated, N, K2, opts, keep_vectors, k_keep);
     T1_2 = (105 - artifact_threshold_2) / 100;
     cut_2 = gedai_eig_threshold(Evald_all_2, N, pct, T1_2);
     clear Evald_all_2
 else
-    cut_2 = []; Utop_2 = []; Dtop_2 = [];
+    cut_2 = [];
 end
-if opts.verbose, fprintf('  [stream] threshold stage: %.2f s\n', toc(tA)); end
+if opts.verbose
+    fprintf('  [stream] threshold stage: %.2f s (t = %.2f .. %.2f, median %.2f)\n', ...
+        toc(tA), min(artifact_threshold), max(artifact_threshold), median(artifact_threshold));
+end
 
 %% ---- cleaning-stage set-up ---------------------------------------------
 state.R_chol = R_chol;
@@ -445,6 +506,208 @@ state.ep_per_chunk = max(1, floor(64*2^20 / max(N * Te * 8, 1)));
 state.enova_next = 1;
 state.pend_O = zeros(N, 0, cls);          % signal of epochs enova_next..
 state.pend_C = zeros(N, 0, cls);          % cleaned output of the same epochs
+end
+
+% =====================================================================
+function t_per_epoch = local_windowed_threshold(src, cls, off, K, Te, R_chol, r, truncated, N, ...
+    refCOV, minThreshold, maxThreshold, noise_multiplier, evecs_Template_cov, ...
+    signal_type, SSI_top_PCs, percentile_threshold, epoch_size, ...
+    smoothing_window_seconds, pct, Evald_all, opts)
+%LOCAL_WINDOWED_THRESHOLD  One SENSAI optimum per sliding window, interpolated.
+%
+%   Why this exists. GEDAI's artifact criterion is an eigenvalue cut, and the cut
+%   sits at exp(T1*(prctile(log(lambda)+100, 98)) - 100) with T1 = (105-t)/100.
+%   Because the percentile is added to 100 before T1 scales it, one unit of t moves
+%   the cut by a factor of e - and measured on a real night the share of a band that
+%   goes from untouched to almost entirely removed spans about five units of t. So
+%   the single scalar t that SENSAI picks for a recording is the most consequential
+%   number in the whole method.
+%
+%   On a whole night that scalar is a compromise. The generalized eigenvalue spectra
+%   are near identical across sleep stages (the leadfield whitening cancels the
+%   delta-power difference), but the leading eigenVECTORS are not: in N3 they point
+%   at slow waves, which are leadfield-plausible, and in wake at blinks and muscle,
+%   which are not. SENSAI scores exactly that difference, so its optimum is genuinely
+%   stage-dependent, and averaging it over a night lands between the two - aggressive
+%   enough to attenuate slow waves, mild enough to leave wake artifacts.
+%
+%   Optimising per window instead keeps one uniform, stage-blind rule for the whole
+%   recording while letting the operating point follow the data, including within a
+%   stage (a quiet N2 stretch and one full of arousals are not the same problem).
+%
+%   The windowing, smoothing and makima interpolation deliberately mirror
+%   local_legacy_begin, so the sliding threshold means the same thing on both paths.
+
+nSub = min(opts.thresh_window_max_epochs, K);
+
+%%% Window geometry. A window is given in seconds, but SENSAI needs a decent number
+%%% of epochs to be stable and the slow bands have epochs tens of seconds long, so
+%%% the epoch floor wins there and those bands simply use longer windows.
+win = max(1, round(smoothing_window_seconds / epoch_size));
+win = min(max(win, opts.thresh_window_min_epochs), K);
+step = max(1, round(win / 2));
+if K <= win
+    nwin = 1; win = K;
+else
+    nwin = ceil((K - win) / step) + 1;
+end
+
+centers = zeros(1, nwin);
+widx    = cell(1, nwin);
+for w = 1:nwin
+    i0 = (w-1)*step + 1;
+    i1 = min(K, i0 + win - 1);
+    if w == nwin && (i1 - i0 + 1) < win/2 && nwin > 1
+        i0 = max(1, K - win + 1); i1 = K;
+    end
+    centers(w) = (i0 + i1) / 2;
+    ii = i0:i1;
+    if numel(ii) > nSub
+        ii = ii(round(linspace(1, numel(ii), nSub)));
+    end
+    widx{w} = ii;
+end
+
+%%% Per-window optimisation. Windows are independent, so they go to the pool in
+%%% waves; as everywhere else here the slices are cut on the client, because a
+%%% parfor cannot slice a source on a window's epoch list and would broadcast the band.
+topt = zeros(1, nwin);
+if opts.parallel_blocks && nwin > 1
+    p = gcp('nocreate');
+    if isempty(p), nw = 1; else, nw = p.NumWorkers; end
+    bytes_per_win = N * Te * nSub * 8;
+    wave = max(1, min(2*nw, floor(32*2^30 / max(bytes_per_win, 1))));
+else
+    wave = 1;
+end
+
+for w0 = 1:wave:nwin
+    w1 = min(nwin, w0 + wave - 1);
+    m  = w1 - w0 + 1;
+    Xw = cell(1, m);
+    for j = 1:m
+        ii = widx{w0+j-1};
+        Xj = zeros(N, Te, numel(ii), cls);
+        for q = 1:numel(ii)
+            s0 = off + (ii(q)-1)*Te;
+            Xj(:,:,q) = gedai_read(src, s0+1, s0+Te, cls);
+        end
+        Xw{j} = Xj;
+    end
+    tj = zeros(1, m);
+    if wave > 1
+        parfor j = 1:m
+            [Ev, Ed] = local_gevd_subset_core(Xw{j}, Te, R_chol, r, truncated, N);
+            tj(j) = SENSAI_fminbnd(minThreshold, maxThreshold, refCOV, Ed, Ev, ...
+                noise_multiplier, evecs_Template_cov, signal_type, SSI_top_PCs, ...
+                percentile_threshold);
+        end
+    else
+        for j = 1:m
+            [Ev, Ed] = local_gevd_subset_core(Xw{j}, Te, R_chol, r, truncated, N);
+            tj(j) = SENSAI_fminbnd(minThreshold, maxThreshold, refCOV, Ed, Ev, ...
+                noise_multiplier, evecs_Template_cov, signal_type, SSI_top_PCs, ...
+                percentile_threshold);
+        end
+    end
+    topt(w0:w1) = tj;
+    clear Xw
+end
+
+%%% Optionally restate each window's threshold against the global eigenvalue percentile.
+%%%
+%%% SENSAI evaluates t on its window's own spectrum, but the cleaning stage applies it
+%%% against the percentile pooled over the whole band, so the cut that lands is not the
+%%% cut SENSAI chose - it is off by exp(T1*(Lp_global - Lp_local)). That looked like a
+%%% defect worth correcting, and this is the correction.
+%%%
+%%% Measured, it is not. Wake windows sit 2-3 log units above the night's pooled
+%%% percentile (the artifact load is genuinely larger there, unlike the three sleep
+%%% stages, which agree to within ~0.5), so leaving the drift in place makes the applied
+%%% cut harsher exactly where the window is noisy and gentler where it is clean - a
+%%% second, automatic adaptation on top of the window's own t. On one night, disabling
+%%% the correction left slow-wave preservation unchanged (10th percentile 99.3 % vs
+%%% 99.0 %) while removing meaningfully more wake artifact (wake EMG 3.35 vs 5.08,
+%%% wake delta 20.2 vs 24.2 uV^2). So the default is off, which is also GEDAI's original
+%%% behaviour; the option stays for anyone who wants the applied cut to be exactly the
+%%% chosen one.
+if opts.thresh_window_recalibrate
+    Lp_glob = local_pool_percentile(Evald_all, N, pct);
+    for w = 1:nwin
+        Lp_loc = local_pool_percentile(Evald_all(:, widx{w}), N, pct);
+        if isfinite(Lp_loc) && isfinite(Lp_glob) && Lp_glob ~= 0
+            T1w  = (105 - topt(w)) / 100;
+            topt(w) = 105 - 100 * (T1w * Lp_loc / Lp_glob);
+        end
+    end
+end
+
+topt = max(minThreshold, min(maxThreshold, topt));
+
+%%% How neighbouring windows are combined.
+%%%
+%%% 'mean' is GEDAI's original behaviour: a 3-window moving average, which with 50 %
+%%% overlap spreads each window's influence over about two window lengths. That is
+%%% fine on average and wrong exactly at a stage transition, where it produces a
+%%% smooth RAMP of cleaning strength across the boundary. A ramp is the worst shape
+%%% for an analysis of the transition itself, because it is indistinguishable from a
+%%% physiological gradient in the thing being measured.
+%%%
+%%% 'min' takes the gentlest of each window's neighbours instead. Higher t is more
+%%% aggressive, so the minimum lets the sleep side's operating point extend into the
+%%% first wake window rather than the wake side's reaching back into sleep. It is the
+%%% continuous, data-driven analogue of gedai.dilateStages, and it makes the error at
+%%% a boundary one-sided: under-cleaned wake, which is visible in the data and can be
+%%% handled downstream, rather than removed slow waves, which cannot be recovered.
+if nwin >= 3
+    switch lower(opts.thresh_window_aggregate)
+        case 'mean', topt = smoothdata(topt, 'movmean', 3);
+        case 'min',  topt = movmin(topt, 3);
+        otherwise
+            error('gedai_band_engine:aggregate', ...
+                'thresh_window_aggregate must be ''mean'' or ''min''.');
+    end
+end
+
+if nwin > 1
+    padded_centers    = [1, centers, K];
+    padded_thresholds = [topt(1), topt, topt(end)];
+    [uc, ui] = unique(padded_centers);
+    ut = padded_thresholds(ui);
+    t_per_epoch = interp1(uc, ut, 1:K, 'makima');
+    %%% makima can overshoot its data, and an overshoot upward is an overshoot towards
+    %%% MORE cleaning than any neighbouring window asked for. Under 'mean' that is
+    %%% legacy behaviour and left alone; under 'min' it would silently defeat the whole
+    %%% point at exactly the stage boundaries the option exists to protect, so the
+    %%% interpolant is clamped to the envelope of the two nodes bracketing each epoch.
+    %%% That makes the guarantee structural rather than a property of the spline.
+    if strcmpi(opts.thresh_window_aggregate, 'min')
+        lo = interp1(uc, ut, 1:K, 'previous');
+        hi = interp1(uc, ut, 1:K, 'next');
+        lo(isnan(lo)) = ut(1);
+        hi(isnan(hi)) = ut(end);
+        t_per_epoch = min(max(t_per_epoch, min(lo, hi)), max(lo, hi));
+    end
+else
+    t_per_epoch = repmat(topt, 1, K);
+end
+end
+
+% =====================================================================
+function Lp = local_pool_percentile(evals, num_chans, pct)
+%LOCAL_POOL_PERCENTILE  The shifted-log percentile gedai_eig_threshold works from,
+%   including its null-space remap, exposed on its own so a window's threshold can
+%   be restated against a different pool.
+mag = abs(evals);
+lv  = log(mag(mag > 0)) + 100;
+if isempty(lv), Lp = NaN; return; end
+n_null = max(0, num_chans - size(evals, 1)) * size(evals, 2);
+if n_null > 0
+    pe = min(100, max(0, (pct/100 * (numel(lv) + n_null) - n_null) / numel(lv) * 100));
+else
+    pe = pct;
+end
+Lp = prctile(lv, pe);
 end
 
 % =====================================================================
@@ -614,11 +877,36 @@ else
     artifacts = [];
 end
 
+if ~isempty(state.capture_windows)
+    state = local_capture_stream(state, seg, first, last, cls);
+end
+
 state.next_block = b1 + 1;
 state.done = b1 >= state.nblocks_1;
 if state.done
     state.pend_O = []; state.pend_C = []; state.src = [];
     state.Utop_1 = []; state.Dtop_1 = []; state.Utop_2 = []; state.Dtop_2 = [];
+end
+end
+
+% =====================================================================
+function state = local_capture_stream(state, seg, first, last, cls)
+%LOCAL_CAPTURE_STREAM  Windows-only removed-field capture (multivariate-prep
+%   issue #25, ADR 0004). For each caller-supplied window overlapping this
+%   step's [first, last], read just the overlapping raw samples and subtract
+%   the matching columns of the already-computed cleaned segment - the same
+%   arithmetic as the want_artifacts branch above, restricted to the tiny
+%   overlap instead of the whole segment. state.src is still valid here (it
+%   is only released once state.done), and nothing band- or segment-sized is
+%   ever held: state.captured{iCap} is exactly the requested window's width.
+CW = state.capture_windows;
+for iCap = 1:size(CW, 1)
+    wS = CW(iCap, 1); wE = CW(iCap, 2);
+    ov0 = max(wS, first); ov1 = min(wE, last);
+    if ov0 > ov1, continue; end
+    raw = gedai_read(state.src, ov0, ov1, cls);
+    cleaned = seg(:, ov0 - first + 1 : ov1 - first + 1);
+    state.captured{iCap}(:, ov0 - wS + 1 : ov1 - wS + 1) = raw - cleaned;
 end
 end
 
@@ -1001,6 +1289,8 @@ function state = local_legacy_begin(state, src, refCOV, artifact_threshold_type,
 N_EEG_electrodes = state.N; epoch_samples = state.Te; cls = state.cls;
 N_epochs = state.K;
 Ulf = state.Ulf; gate = state.gate;
+thresh_window_min_epochs = state.thresh_window_min_epochs;
+thresh_window_aggregate  = state.thresh_window_aggregate;
 
 if state.K2 == 0
     % The matrix code failed here too, one step later: the shifted grid is
@@ -1070,6 +1360,14 @@ else
     window_seconds = smoothing_window_seconds;
 end
 window_epochs = max(1, round(window_seconds / epoch_size));
+%%% A window is specified in seconds, but SENSAI optimises over epochs and needs
+%%% enough of them to be stable. The slowest wavelet bands have epochs of one to
+%%% three minutes, where a 300 s window holds two or three - not a distribution.
+%%% Those bands therefore use a longer window than asked for, rather than a
+%%% threshold fitted to a handful of epochs. Same floor as local_windowed_threshold.
+if ~isinf(smoothing_window_seconds)
+    window_epochs = min(max(window_epochs, thresh_window_min_epochs), N_epochs);
+end
 step_epochs = max(1, round(window_epochs / 2));
 
 num_windows = max(1, ceil((N_epochs - window_epochs) / step_epochs) + 1);
@@ -1140,13 +1438,32 @@ end
 
 if num_windows > 1
     if num_windows >= 3
-        optimal_threshold_per_window = smoothdata(optimal_threshold_per_window, 'movmean', 3);
+        %%% See local_windowed_threshold: 'min' keeps a stage transition from pulling a
+        %%% wake-strength threshold back over sleep, at the cost of under-cleaning the
+        %%% first window after the transition.
+        switch lower(thresh_window_aggregate)
+            case 'mean', optimal_threshold_per_window = smoothdata(optimal_threshold_per_window, 'movmean', 3);
+            case 'min',  optimal_threshold_per_window = movmin(optimal_threshold_per_window, 3);
+            otherwise
+                error('gedai_band_engine:aggregate', ...
+                    'thresh_window_aggregate must be ''mean'' or ''min''.');
+        end
     end
     padded_centers    = [1, window_centers, N_epochs];
     padded_thresholds = [optimal_threshold_per_window(1), optimal_threshold_per_window, optimal_threshold_per_window(end)];
     [unique_centers, unique_idx] = unique(padded_centers);
     unique_thresholds = padded_thresholds(unique_idx);
     artifact_threshold_array = interp1(unique_centers, unique_thresholds, 1:N_epochs, 'makima');
+    %%% makima can overshoot its data - see local_windowed_threshold for why that is
+    %%% only acceptable under 'mean'. Under 'min' the interpolant is clamped to the
+    %%% envelope of the two nodes bracketing each epoch.
+    if strcmpi(thresh_window_aggregate, 'min')
+        lo = interp1(unique_centers, unique_thresholds, 1:N_epochs, 'previous');
+        hi = interp1(unique_centers, unique_thresholds, 1:N_epochs, 'next');
+        lo(isnan(lo)) = unique_thresholds(1);
+        hi(isnan(hi)) = unique_thresholds(end);
+        artifact_threshold_array = min(max(artifact_threshold_array, min(lo, hi)), max(lo, hi));
+    end
 else
     artifact_threshold_array = repmat(optimal_threshold_per_window, 1, N_epochs);
 end
@@ -1169,6 +1486,13 @@ end
 P = state.P; sh = state.sh; K2 = state.K2;
 len = state.nEp * epoch_samples;     % whole epochs inside the signal, for ENOVA
 keep_tail = state.want_artifacts;
+%%% Capture windows (multivariate-prep issue #25, ADR 0004) that reach past len
+%%% into the sub-epoch tail need At computed too, even when the caller did not
+%%% ask for want_artifacts; capture_windows is empty by default, so this never
+%%% fires in production.
+if size(state.capture_windows, 1) > 0 && any(state.capture_windows(:, 2) > len)
+    keep_tail = true;
+end
 C  = zeros(N_EEG_electrodes, P, cls);
 A  = zeros(N_EEG_electrodes, len, cls);                 % artifacts of the whole epochs
 At = zeros(N_EEG_electrodes, (P - len) * keep_tail, cls); % the rest, only for the caller
@@ -1229,6 +1553,14 @@ clear Evec Evald
 % their own var() is done.
 num_epochs = state.nEp;
 var_art = var(reshape(A, [], num_epochs), 0, 1);
+%%% Removed-field capture (issue #25, ADR 0004): A (whole epochs) and At (the
+%%% tail, populated above whenever a window needs it) still hold pure removed
+%%% field here, before the branch below either concatenates or overwrites
+%%% them in place. Reading it now means capture never needs its own copy of
+%%% either array.
+if size(state.capture_windows, 1) > 0
+    state = local_capture_legacy(state, A, At, len);
+end
 if state.want_artifacts
     var_orig = var(reshape(C(:, 1:len) + A, [], num_epochs), 0, 1);
     A = [A, At];
@@ -1257,6 +1589,35 @@ state.SENSAI_score = SENSAI_score;
 state.artifact_threshold_out = artifact_threshold_out;
 state.samples_per_step = max(1, floor(256 * 2^20 / (4 * N_EEG_electrodes)));
 state.next_sample = 1;
+end
+
+% =====================================================================
+function state = local_capture_legacy(state, A, At, len)
+%LOCAL_CAPTURE_LEGACY  Windows-only removed-field capture (multivariate-prep
+%   issue #25, ADR 0004). A (samples 1..len, the whole-epoch region) and At
+%   (samples len+1..P, the sub-epoch tail - only populated when keep_tail was
+%   forced on for a window reaching that far) hold this band's pure removed
+%   field at the point local_legacy_begin calls this, before A is either
+%   concatenated with At (want_artifacts) or overwritten in place with
+%   cleaned + artifacts (~want_artifacts). Called only when capture_windows is
+%   non-empty, so production (capture_windows = zeros(0, 2)) never runs it.
+CW = state.capture_windows;
+P = len + size(At, 2);
+for iCap = 1:size(CW, 1)
+    wS = CW(iCap, 1); wE = CW(iCap, 2);
+    lo = max(wS, 1); hi = min(wE, P);
+    if lo > hi, continue; end
+    out = state.captured{iCap};
+    a0 = max(lo, 1); a1 = min(hi, len);
+    if a0 <= a1
+        out(:, a0 - wS + 1 : a1 - wS + 1) = A(:, a0:a1);
+    end
+    t0 = max(lo, len + 1); t1 = min(hi, P);
+    if t0 <= t1
+        out(:, t0 - wS + 1 : t1 - wS + 1) = At(:, t0 - len : t1 - len);
+    end
+    state.captured{iCap} = out;
+end
 end
 
 % =====================================================================
